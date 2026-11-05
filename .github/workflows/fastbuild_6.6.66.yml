@@ -630,7 +630,20 @@ jobs:
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+          # 同一次 Kbuild 同时构建 Image 和 modules。
+          # CONFIG_MODVERSIONS=y 时，Frida 外部模块需要本次内核构建生成的 Module.symvers CRC。
+          # 不能等 Image 构建结束后再单独调用 modules_prepare/modules，因为该 OKI 源码树
+          # 在构建后可能触发 Kbuild 的 source-tree-clean 检查。
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image modules
+
+          if [ ! -f out/Module.symvers ]; then
+            echo "::error::Image + modules 构建完成后仍未生成 out/Module.symvers"
+            exit 1
+          fi
+
+          echo "Module.symvers 已生成："
+          ls -lh out/Module.symvers
+          wc -l out/Module.symvers
           
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
@@ -687,22 +700,12 @@ jobs:
           echo "=== 搜索现有 .config ==="
           find "$WORKDIR" -maxdepth 6 -type f -name '.config' -print || true
 
-          # 正常情况下前面的 O=out gki_defconfig 会生成 out/.config。
-          # 如果该文件因为清理/构建逻辑丢失，则使用当前已修改过的
-          # gki_defconfig 在同一 KOUT 中恢复 external-module 所需配置。
+          # 前面的 Kernel Kbuild 应当已经生成 out/.config。
+          # 这里不再重新调用任何普通 Kernel target，避免该 OKI 源码树在构建后
+          # 触发 Kbuild 的 source-tree-clean 检查。
           if [ ! -f "$CFG" ]; then
-            echo "::warning::$CFG 不存在，重新生成 gki_defconfig"
-
-            make -C "$KDIR" \
-              O="$KOUT" \
-              LLVM=1 \
-              ARCH=arm64 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              gki_defconfig
-          fi
-
-          if [ ! -f "$CFG" ]; then
-            echo "::error::重新生成后仍然找不到 $CFG"
+            echo "::error::找不到 $CFG"
+            echo "::error::前面的 gki_defconfig / Image modules 构建没有留下完整 KOUT"
             exit 1
           fi
 
