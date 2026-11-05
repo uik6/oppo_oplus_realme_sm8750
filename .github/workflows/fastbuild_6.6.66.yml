@@ -7,6 +7,7 @@ env:
   SUB_VERSION: '66'
   KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
   CCACHE_KEY: ccache-ecsv4-6.6.66
+  FRIDA_VERSION: '17.25.2'
 
 on:
   workflow_dispatch:
@@ -640,6 +641,244 @@ jobs:
           ccache -s
           echo "编译后空间:"
           df -h
+
+      - name: 检查 Frida Barebone 内核依赖
+        run: |
+          set -e
+
+          CFG="${{ github.workspace }}/kernel_workspace/common/out/.config"
+
+          echo "检查内核配置: $CFG"
+
+          test -f "$CFG"
+
+          grep -q '^CONFIG_MODULES=y' "$CFG" || {
+            echo "::error::当前内核没有 CONFIG_MODULES=y"
+            exit 1
+          }
+
+          grep -q '^CONFIG_KPROBES=y' "$CFG" || {
+            echo "::error::当前内核没有 CONFIG_KPROBES=y"
+            exit 1
+          }
+
+          grep -q '^CONFIG_KALLSYMS_ALL=y' "$CFG" || {
+            echo "::error::当前内核没有 CONFIG_KALLSYMS_ALL=y"
+            exit 1
+          }
+
+          if grep -q '^CONFIG_MODULE_SIG_FORCE=y' "$CFG"; then
+            echo "::error::CONFIG_MODULE_SIG_FORCE=y，无法直接 insmod 未签名模块"
+            exit 1
+          fi
+
+          echo "Frida Barebone 所需内核配置检查通过"
+
+          echo
+          echo "Kernel release:"
+          cat "${{ github.workspace }}/kernel_workspace/common/out/include/config/kernel.release" || true
+
+          echo
+          echo "Module.symvers:"
+          ls -lh "${{ github.workspace }}/kernel_workspace/common/out/Module.symvers"
+
+      - name: 下载 Frida Barebone 源码和依赖
+        run: |
+          set -euxo pipefail
+
+          WORKDIR="${{ github.workspace }}/kernel_workspace"
+          FRIDA_VERSION="${{ env.FRIDA_VERSION }}"
+
+          cd "$WORKDIR"
+
+          rm -rf frida-core
+          rm -rf gumjs-devkit
+          rm -rf sdk-none-arm64-softfloat_nopic
+
+          echo "下载 Frida Core $FRIDA_VERSION"
+
+          git clone \
+            --branch "$FRIDA_VERSION" \
+            --depth 1 \
+            --recurse-submodules \
+            --shallow-submodules \
+            https://github.com/frida/frida-core.git
+
+          cd frida-core
+
+          echo "下载 GumJS devkit..."
+
+          curl -fL \
+            "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gumjs-devkit-${FRIDA_VERSION}-none-arm64-softfloat_nopic.tar.xz" \
+            -o /tmp/frida-gumjs-devkit.tar.xz
+
+          mkdir -p "$WORKDIR/gumjs-devkit"
+
+          tar -xJf /tmp/frida-gumjs-devkit.tar.xz \
+            -C "$WORKDIR/gumjs-devkit"
+
+          echo "同步 Frida soft-float SDK..."
+
+          ./releng/deps.py sync \
+            sdk \
+            none-arm64-softfloat_nopic \
+            "$WORKDIR/sdk-none-arm64-softfloat_nopic"
+
+          echo
+          echo "GumJS devkit:"
+          ls -lah "$WORKDIR/gumjs-devkit"
+
+          echo
+          echo "Frida SDK:"
+          ls -lah "$WORKDIR/sdk-none-arm64-softfloat_nopic"
+
+      - name: 编译 Frida Barebone frida-agent.ko
+        run: |
+          set -euxo pipefail
+
+          WORKDIR="${{ github.workspace }}/kernel_workspace"
+
+          KDIR="$WORKDIR/common"
+          KOUT="$WORKDIR/common/out"
+
+          FRIDA_DIR="$WORKDIR/frida-core"
+          FRIDA_SDK="$WORKDIR/sdk-none-arm64-softfloat_nopic"
+          GUMJS_DEVKIT="$WORKDIR/gumjs-devkit"
+
+          #
+          # 关键：
+          # Kbuild 仍然使用项目自己的 Clang 18。
+          #
+          export PATH="$WORKDIR/clang18/bin:$WORKDIR/build-tools/bin:$PATH"
+
+          echo "Kernel compiler:"
+          clang --version | head -n 1
+
+          #
+          # Frida agent 自身必须使用 clang >= 19。
+          #
+          if command -v clang-20 >/dev/null 2>&1; then
+            AGENT_CLANG="$(command -v clang-20)"
+          else
+            AGENT_CLANG="$(command -v clang-19)"
+          fi
+
+          echo "Frida Agent compiler:"
+          "$AGENT_CLANG" --version | head -n 1
+
+          cd "$FRIDA_DIR"
+
+          make -C src/barebone/agent/linux \
+            ARCH=arm64 \
+            FRIDA_SDK="$FRIDA_SDK" \
+            GUMJS_DEVKIT_DIR="$GUMJS_DEVKIT" \
+            AGENT_CC="$AGENT_CLANG" \
+            AGENT_LD=aarch64-linux-gnu-ld \
+            AGENT_AR=aarch64-linux-gnu-ar \
+            AGENT_NM=aarch64-linux-gnu-nm \
+            AGENT_OBJCOPY=aarch64-linux-gnu-objcopy \
+            KDIR="$KDIR" \
+            KOUT="$KOUT" \
+            LLVM=1
+
+          KO="$FRIDA_DIR/src/barebone/agent/linux/frida-agent.ko"
+
+          test -f "$KO"
+
+          echo
+          echo "========================================"
+          echo "Frida Kernel Module build successful"
+          echo "========================================"
+
+          ls -lh "$KO"
+
+          file "$KO"
+
+          echo
+          echo "modinfo:"
+          modinfo "$KO" || true
+
+          echo
+          echo "Kernel release:"
+          cat "$KOUT/include/config/kernel.release" || true
+
+          mkdir -p "$WORKDIR/frida-output"
+
+          cp "$KO" \
+            "$WORKDIR/frida-output/frida-agent.ko"
+
+          cp \
+            "$FRIDA_DIR/src/barebone/agent/etc/linux-kmod.json" \
+            "$WORKDIR/frida-output/linux-kmod.json"
+
+          cp "$KOUT/.config" \
+            "$WORKDIR/frida-output/kernel.config"
+
+          cp "$KOUT/Module.symvers" \
+            "$WORKDIR/frida-output/Module.symvers"
+
+          modinfo "$KO" > \
+            "$WORKDIR/frida-output/modinfo.txt" || true
+
+          cat "$KOUT/include/config/kernel.release" > \
+            "$WORKDIR/frida-output/kernel.release"
+
+      - name: 上传 Frida Kernel Module
+        uses: actions/upload-artifact@v7
+        with:
+          name: Frida-Barebone-${{ env.FRIDA_VERSION }}-${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}
+          path: |
+            ${{ github.workspace }}/kernel_workspace/frida-output/frida-agent.ko
+            ${{ github.workspace }}/kernel_workspace/frida-output/linux-kmod.json
+            ${{ github.workspace }}/kernel_workspace/frida-output/kernel.release
+            ${{ github.workspace }}/kernel_workspace/frida-output/modinfo.txt
+            ${{ github.workspace }}/kernel_workspace/frida-output/kernel.config
+            ${{ github.workspace }}/kernel_workspace/frida-output/Module.symvers
+
+      - name: 准备 Frida Barebone 构建环境
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils-aarch64-linux-gnu \
+            xz-utils \
+            kmod \
+            curl \
+            git
+
+          # Frida 的 soft-float ARM64 agent 需要 Clang >= 19。
+          # 先检查 GitHub Runner 是否已经提供。
+          if command -v clang-20 >/dev/null 2>&1; then
+            echo "使用现有 clang-20"
+            clang-20 --version
+          elif command -v clang-19 >/dev/null 2>&1; then
+            echo "使用现有 clang-19"
+            clang-19 --version
+          else
+            echo "安装 LLVM/Clang 20..."
+            curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+            chmod +x /tmp/llvm.sh
+            sudo /tmp/llvm.sh 20
+            clang-20 --version
+          fi
+
+          # GitHub Runner 一般已有 Rust。
+          # 没有的话再安装。
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf \
+              https://sh.rustup.rs | sh -s -- -y
+
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+
+          rustup target add aarch64-unknown-none
+          rustup component add rust-src
+
+          rustc --version
+          cargo --version
+          aarch64-linux-gnu-ld --version | head -n 1
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
