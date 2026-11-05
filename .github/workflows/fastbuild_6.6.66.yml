@@ -757,19 +757,29 @@ jobs:
           fi
 
           echo
-          echo "=== 准备 external module 构建环境 ==="
+          echo "=== 检查已完成 Kernel build 的 generated files ==="
 
-          make -C "$KDIR" \
-            O="$KOUT" \
-            LLVM=1 \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            modules_prepare
+          # 前面的 Image 已经完整构建完成，因此这里不要再次执行 modules_prepare。
+          # 该 OKI 源码树在应用 KSU/SUSFS 等补丁后会被 Kbuild 的 O= 检查视为
+          # source tree not clean；再次执行 modules_prepare 会触发 outputmakefile 检查并失败。
+          # Frida 自己最终会通过 M=<frida module dir> 调用 external-module Kbuild。
+          for REQUIRED in \
+            "$KOUT/include/config/auto.conf" \
+            "$KOUT/include/generated/autoconf.h" \
+            "$KOUT/include/config/kernel.release"
+          do
+            if [ ! -f "$REQUIRED" ]; then
+              echo "::error::完整 Image 构建后仍缺少 generated file: $REQUIRED"
+              echo "::error::请检查前面的 Kernel Image 构建是否真正完成"
+              exit 1
+            fi
+            ls -lh "$REQUIRED"
+          done
 
           echo
           echo "=== Kernel release ==="
 
-          KERNEL_RELEASE="$(make -s -C "$KDIR" O="$KOUT" ARCH=arm64 kernelrelease)"
+          KERNEL_RELEASE="$(cat "$KOUT/include/config/kernel.release")"
           echo "$KERNEL_RELEASE"
           echo "FRIDA_KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
 
@@ -999,7 +1009,7 @@ jobs:
 
           echo
           echo "=== Kernel release ==="
-          make -s -C "$KDIR" O="$KOUT" ARCH=arm64 kernelrelease
+          cat "$KOUT/include/config/kernel.release"
 
           cd "$FRIDA_DIR"
 
@@ -1071,12 +1081,8 @@ jobs:
           modinfo "$KO" > "$OUTPUT/modinfo.txt" || true
           modinfo -F vermagic "$KO" > "$OUTPUT/vermagic.txt" || true
 
-          make -s \
-            -C "$KDIR" \
-            O="$KOUT" \
-            ARCH=arm64 \
-            kernelrelease \
-            > "$OUTPUT/kernel.release"
+          cp "$KOUT/include/config/kernel.release" \
+            "$OUTPUT/kernel.release"
 
           {
             echo "Frida version: ${{ env.FRIDA_VERSION }}"
