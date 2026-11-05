@@ -1028,6 +1028,108 @@ jobs:
           grep -n -A4 -B2 'undo_list = leader->sysvsem.undo_list' "$FRIDA_LINUX/frida-kmod.c"
           tail -n 8 "$FRIDA_LINUX/Kbuild"
 
+      - name: 修复 Frida Android FIFO 分配并增加运行时诊断
+        run: |
+          set -euxo pipefail
+
+          FRIDA_KMOD="${{ github.workspace }}/kernel_workspace/frida-core/src/barebone/agent/linux/frida-kmod.c"
+          export FRIDA_KMOD
+          test -f "$FRIDA_KMOD"
+
+          python3 <<'PY_FIFO'
+          import os
+          import re
+          from pathlib import Path
+
+          p = Path(os.environ["FRIDA_KMOD"])
+          text = p.read_text()
+
+          decl = "static DECLARE_KFIFO_PTR (frida_to_client, u8);\nstatic DECLARE_KFIFO_PTR (frida_from_client, u8);\n"
+          decl_new = decl + "static void * frida_to_client_storage;\nstatic void * frida_from_client_storage;\n"
+          if "frida_to_client_storage" not in text:
+              if decl not in text:
+                  raise SystemExit("cannot locate FIFO declarations")
+              text = text.replace(decl, decl_new, 1)
+
+          open_lines = [
+              "int",
+              "frida_kmod_link_open (void)",
+              "{",
+              "  int res;",
+              "",
+              "  frida_to_client_storage = kvzalloc (FRIDA_LINK_CAPACITY, GFP_KERNEL);",
+              "  if (frida_to_client_storage == NULL)",
+              "  {",
+              "    printk (KERN_ERR \"frida: failed to allocate to-client FIFO storage (%u bytes)\\n\", FRIDA_LINK_CAPACITY);",
+              "    return -ENOMEM;",
+              "  }",
+              "  res = kfifo_init (&frida_to_client, frida_to_client_storage, FRIDA_LINK_CAPACITY);",
+              "  if (res != 0)",
+              "  {",
+              "    printk (KERN_ERR \"frida: kfifo_init(to-client) failed: %d\\n\", res);",
+              "    goto free_to_client;",
+              "  }",
+              "",
+              "  frida_from_client_storage = kvzalloc (FRIDA_LINK_CAPACITY, GFP_KERNEL);",
+              "  if (frida_from_client_storage == NULL)",
+              "  {",
+              "    res = -ENOMEM;",
+              "    printk (KERN_ERR \"frida: failed to allocate from-client FIFO storage (%u bytes)\\n\", FRIDA_LINK_CAPACITY);",
+              "    goto free_to_client;",
+              "  }",
+              "  res = kfifo_init (&frida_from_client, frida_from_client_storage, FRIDA_LINK_CAPACITY);",
+              "  if (res != 0)",
+              "  {",
+              "    printk (KERN_ERR \"frida: kfifo_init(from-client) failed: %d\\n\", res);",
+              "    goto free_from_client;",
+              "  }",
+              "",
+              "  res = misc_register (&frida_dev);",
+              "  if (res != 0)",
+              "  {",
+              "    printk (KERN_ERR \"frida: misc_register(/dev/%s) failed: %d\\n\", frida_dev.name, res);",
+              "    goto free_from_client;",
+              "  }",
+              "  frida_link_registered = true;",
+              "",
+              "  printk (KERN_INFO \"frida: listening on /dev/%s\\n\", frida_dev.name);",
+              "",
+              "  return 0;",
+              "",
+              "free_from_client:",
+              "  kvfree (frida_from_client_storage);",
+              "  frida_from_client_storage = NULL;",
+              "free_to_client:",
+              "  kvfree (frida_to_client_storage);",
+              "  frida_to_client_storage = NULL;",
+              "",
+              "  return res;",
+              "}",
+              "",
+          ]
+          new_open = "\n".join(open_lines)
+
+          if "failed to allocate to-client FIFO storage" not in text:
+              pat = r"int\nfrida_kmod_link_open \(void\)\n\{.*?\n\}\n(?=int\nfrida_kmod_link_send)"
+              text, n = re.subn(pat, new_open, text, count=1, flags=re.S)
+              if n != 1:
+                  raise SystemExit("cannot locate frida_kmod_link_open()")
+
+          old_close = "  misc_deregister (&frida_dev);\n  kfifo_free (&frida_from_client);\n  kfifo_free (&frida_to_client);\n"
+          new_close = "  misc_deregister (&frida_dev);\n  kvfree (frida_from_client_storage);\n  frida_from_client_storage = NULL;\n  kvfree (frida_to_client_storage);\n  frida_to_client_storage = NULL;\n"
+          if old_close in text:
+              text = text.replace(old_close, new_close, 1)
+          elif "kvfree (frida_from_client_storage);" not in text.split("frida_kmod_link_close", 1)[-1]:
+              raise SystemExit("cannot locate frida_kmod_link_close() cleanup")
+
+          p.write_text(text)
+          PY_FIFO
+
+          echo "=== FIFO patch verification ==="
+          grep -n -A14 -B5 'failed to allocate to-client FIFO storage' "$FRIDA_KMOD"
+          grep -n 'misc_register(/dev/%s) failed' "$FRIDA_KMOD"
+          grep -n -A8 'frida_kmod_link_close' "$FRIDA_KMOD" | tail -n 12
+
       - name: 编译 Frida Barebone frida-agent.ko
         run: |
           set -euxo pipefail
