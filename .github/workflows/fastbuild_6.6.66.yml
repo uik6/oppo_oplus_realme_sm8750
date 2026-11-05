@@ -721,6 +721,7 @@ jobs:
             CONFIG_KPROBES \
             CONFIG_KALLSYMS \
             CONFIG_KALLSYMS_ALL \
+            CONFIG_SYSVIPC \
             CONFIG_MODVERSIONS \
             CONFIG_MODULE_SIG \
             CONFIG_MODULE_SIG_FORCE \
@@ -963,6 +964,69 @@ jobs:
 
           echo
           echo "Frida source / GumJS devkit / SDK 准备完成"
+
+      - name: 应用 Frida Android 6.6 / OPlus 兼容补丁
+        run: |
+          set -euxo pipefail
+
+          FRIDA_LINUX="${{ github.workspace }}/kernel_workspace/frida-core/src/barebone/agent/linux"
+          export FRIDA_LINUX
+
+          test -f "$FRIDA_LINUX/frida-kmod.c"
+          test -f "$FRIDA_LINUX/Kbuild"
+
+          python3 <<'PY_PATCH'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["FRIDA_LINUX"])
+          src = root / "frida-kmod.c"
+          kbuild = root / "Kbuild"
+
+          text = src.read_text()
+
+          # Android/Linux 6.6 keeps the full struct kernel_symbol definition in
+          # kernel/module/internal.h while linux/module.h only forward-declares it.
+          # Frida 17.25.2 directly dereferences kernel_symbol fields, so make the
+          # target kernel's internal definition visible to this external module.
+          needle = '#include <linux/module.h>\n'
+          replacement = '#include <linux/module.h>\n#include "internal.h"\n'
+          if '#include "internal.h"' not in text:
+              if needle not in text:
+                  raise SystemExit('cannot locate linux/module.h include')
+              text = text.replace(needle, replacement, 1)
+
+          # task_struct::sysvsem only exists when CONFIG_SYSVIPC=y. Frida 17.25.2
+          # accesses it unconditionally. On Android GKI/OKI kernels with SYSVIPC
+          # disabled, there is no semaphore undo-list state to inherit, so compile
+          # that part only when the kernel actually provides the field.
+          old_decl = '  const struct cred * old_real_cred = current->real_cred;\n  void * undo_list = leader->sysvsem.undo_list;\n  int fs_dead;\n'
+          new_decl = '  const struct cred * old_real_cred = current->real_cred;\n#ifdef CONFIG_SYSVIPC\n  void * undo_list = leader->sysvsem.undo_list;\n#endif\n  int fs_dead;\n'
+          if old_decl in text:
+              text = text.replace(old_decl, new_decl, 1)
+          elif '#ifdef CONFIG_SYSVIPC\n  void * undo_list = leader->sysvsem.undo_list;' not in text:
+              raise SystemExit('cannot locate sysvsem declaration')
+
+          old_use = '  if (undo_list != NULL)\n  {\n    refcount_inc (&((struct frida_sem_undo_list *) undo_list)->refcnt);\n    current->sysvsem.undo_list = undo_list;\n  }\n'
+          new_use = '#ifdef CONFIG_SYSVIPC\n  if (undo_list != NULL)\n  {\n    refcount_inc (&((struct frida_sem_undo_list *) undo_list)->refcnt);\n    current->sysvsem.undo_list = undo_list;\n  }\n#endif\n'
+          if old_use in text:
+              text = text.replace(old_use, new_use, 1)
+          elif '#ifdef CONFIG_SYSVIPC\n  if (undo_list != NULL)' not in text:
+              raise SystemExit('cannot locate sysvsem use block')
+
+          src.write_text(text)
+
+          ktext = kbuild.read_text()
+          inc = 'ccflags-y += -I$(srctree)/kernel/module\n'
+          if inc not in ktext:
+              ktext += '\n# Android 6.6 keeps struct kernel_symbol in kernel/module/internal.h\n' + inc
+          kbuild.write_text(ktext)
+          PY_PATCH
+
+          echo "=== 验证 Frida 兼容补丁 ==="
+          grep -n 'include "internal.h"' "$FRIDA_LINUX/frida-kmod.c"
+          grep -n -A4 -B2 'undo_list = leader->sysvsem.undo_list' "$FRIDA_LINUX/frida-kmod.c"
+          tail -n 8 "$FRIDA_LINUX/Kbuild"
 
       - name: 编译 Frida Barebone frida-agent.ko
         run: |
