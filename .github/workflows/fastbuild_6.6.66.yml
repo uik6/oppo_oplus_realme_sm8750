@@ -454,6 +454,68 @@ jobs:
           grep -n -A4 -B2 'undo_list = leader->sysvsem.undo_list' "$FRIDA_LINUX/frida-kmod.c"
           tail -n 8 "$FRIDA_LINUX/Kbuild"
 
+      - name: 修复模块通知回调的 C / Rust CFI 边界
+        run: |
+          set -euo pipefail
+          export FRIDA_KMOD="$WORKDIR/frida-core/src/barebone/agent/linux/frida-kmod.c"
+
+          python3 <<'PY_CALLBACK_CFI'
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["FRIDA_KMOD"])
+          text = p.read_text()
+          # The callback uses the C ABI, but the freestanding Rust agent is not
+          # built with kernel KCFI metadata. The notifier adapter must use the
+          # same boundary annotation as frida_thread_trampoline and the module
+          # enumeration adapters. Keep CFI enabled for the rest of the module.
+          replacements = (
+              (
+                  'static int frida_kmod_on_module_state (struct notifier_block * nb, unsigned long action,\n',
+                  'static int __nocfi frida_kmod_on_module_state (struct notifier_block * nb, unsigned long action,\n',
+              ),
+              (
+                  'static int\nfrida_kmod_on_module_state (struct notifier_block * nb, unsigned long action, void * data)\n',
+                  '/* The C-ABI Rust callback has no kernel KCFI type metadata. */\n'
+                  'static int __nocfi\nfrida_kmod_on_module_state (struct notifier_block * nb, unsigned long action, void * data)\n',
+              ),
+          )
+          for old, new in replacements:
+              if new in text:
+                  if text.count(new) != 1 or old in text:
+                      raise SystemExit('ambiguous module notifier CFI boundary')
+                  continue
+              if text.count(old) != 1:
+                  raise SystemExit(f'cannot uniquely locate module notifier CFI patch target: {old}')
+              text = text.replace(old, new, 1)
+
+          # Keep module notifications working; do not bypass registration or the
+          # Rust callback to avoid the panic. Audit the other C-to-agent adapters.
+          for needle in (
+              '.notifier_call = frida_kmod_on_module_state,',
+              '  register_module_notifier (&frida_kmod_module_notifier);',
+              '  unregister_module_notifier (&frida_kmod_module_notifier);',
+              '  frida_kmod_module_event_func (loaded, mod->name, "", base, size,',
+              'static int __nocfi\nfrida_thread_trampoline (void * data)',
+              'static int __nocfi\nfrida_on_each_symbol (void * data,',
+              'void __nocfi\nfrida_kmod_enumerate_modules (',
+              'int __nocfi\nfrida_kmod_enumerate_module_symbols (',
+              'int __nocfi\nfrida_kmod_enumerate_module_exports (',
+          ):
+              if text.count(needle) != 1:
+                  raise SystemExit(f'C/Rust callback boundary verification failed: {needle}')
+
+          marker = 'MODULE_INFO (frida_callback_compat, "module-notifier-cfi-v1");'
+          if marker not in text:
+              text += '\n' + marker + '\n'
+          if text.count(marker) != 1:
+              raise SystemExit('ambiguous module notifier compatibility marker')
+          if text != p.read_text():
+              p.write_text(text)
+          PY_CALLBACK_CFI
+
+          grep -n -A24 -B2 '^frida_kmod_on_module_state (' "$FRIDA_KMOD"
+
       - name: 修复内核注入线程的凭据和进程计数迁移
         run: |
           set -euo pipefail
@@ -743,6 +805,7 @@ jobs:
           test "${VERMAGIC%% *}" = "$EXPECTED_RELEASE"
           test "$(modinfo -F frida_compat "$KO")" = 'android6.6-pid-v1'
           test "$(modinfo -F frida_context_compat "$KO")" = 'ucounts-v1'
+          test "$(modinfo -F frida_callback_compat "$KO")" = 'module-notifier-cfi-v1'
           mkdir -p "$OUTPUT"
           cp "$KO" "$OUTPUT/frida-agent.ko"
           cp "$WORKDIR/frida-core/src/barebone/agent/etc/linux-kmod.json" "$OUTPUT/"
@@ -756,6 +819,7 @@ jobs:
             echo "Frida commit: $FRIDA_SHA"
             echo 'Frida compatibility: android6.6-pid-v1 (two-argument detach_pid, CFI enabled)'
              echo 'Frida thread context: ucounts-v1 (balanced RLIMIT_NPROC credential transfer)'
+             echo 'Frida callback boundary: module-notifier-cfi-v1 (C/Rust notifier boundary only; kernel CFI retained)'
             echo "Kernel release: $EXPECTED_RELEASE"
             echo "Kernel source: $KERNEL_REPO@$KERNEL_SHA"
             echo "Config SHA256: $(sha256sum "$KOUT/.config" | cut -d ' ' -f1)"
@@ -772,6 +836,8 @@ jobs:
           adb shell su -c 'insmod /data/local/tmp/frida-agent.ko'
           adb shell su -c 'ls -l /dev/frida'
           adb shell su -c 'dmesg | tail -100'
+            # 用 modinfo -F frida_callback_compat frida-agent.ko 确认输出
+            # module-notifier-cfi-v1；缺少该标记的旧产物仍可能在后续模块事件时 CFI panic。
             # 若旧模块已触发 dec_rlimit_ucounts 下溢及 pthread_create(EAGAIN)，
             # 替换 .ko 不会重置 UID 的运行时计数；需重启后加载新模块再验收。
             # 不加载任何兼容脚本，先验证 Java bridge 的原始初始化路径：
@@ -785,6 +851,7 @@ jobs:
             echo "- Compile cache: ${{ steps.compile-cache.outputs.cache-hit == 'true' && 'hit' || 'miss or fallback' }}"
             echo '- 唯一编译产物：frida-agent.ko；附带配置、符号表和诊断信息。'
              echo '- 线程凭据补丁：ucounts-v1；迁移 RLIMIT_NPROC 计数，避免注入线程退出时扣错 UID。'
+             echo '- 模块通知补丁：module-notifier-cfi-v1；修复 C 调用 Rust 模块事件回调时的 CFI panic。'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传 frida-agent.ko
