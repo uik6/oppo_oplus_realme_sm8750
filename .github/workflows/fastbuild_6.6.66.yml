@@ -154,8 +154,9 @@ jobs:
           git clone --depth=1 --single-branch --branch "$FRIDA_VERSION" \
             https://github.com/frida/frida-core.git "$WORKDIR/frida-core"
           test "$(git -C "$WORKDIR/frida-core" rev-parse HEAD)" = "$FRIDA_SHA"
-          # 只初始化 SDK 同步工具，不递归拉取无关子模块。
-          git -C "$WORKDIR/frida-core" submodule update --init --depth=1 releng
+          # SDK 同步工具依赖 releng 内部固定版本的 tomlkit 和 Meson 子模块。
+          git -C "$WORKDIR/frida-core" submodule update --init --recursive --depth=1 releng
+          python3 "$WORKDIR/frida-core/releng/deps.py" --help > /dev/null
 
           # 独立下载任务并行运行，逐个等待，任一失败都会使步骤失败。
           (
