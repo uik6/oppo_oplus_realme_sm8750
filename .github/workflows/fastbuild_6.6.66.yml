@@ -1172,6 +1172,483 @@ jobs:
           grep -n -A8 -B3 'misc_register(/dev/%s) failed' "$FRIDA_KMOD"
           grep -n -A14 'frida_kmod_link_close' "$FRIDA_KMOD" | tail -n 18
 
+      - name: 应用 Frida kernel-assisted injector CFI/阶段诊断补丁
+        run: |
+          set -euxo pipefail
+
+          FRIDA_KMOD="${{ github.workspace }}/kernel_workspace/frida-core/src/barebone/agent/linux/frida-kmod.c"
+          export FRIDA_KMOD
+          test -f "$FRIDA_KMOD"
+
+          python3 <<'PY_INJECT'
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["FRIDA_KMOD"])
+          text = p.read_text()
+
+          def replace_once(old, new, label):
+              global text
+              if new in text:
+                  return
+              if old not in text:
+                  raise SystemExit(f"cannot locate {label}")
+              text = text.replace(old, new, 1)
+
+          def patch_function(name, edits):
+              global text
+              needle = "\n" + name + " ("
+              pos = text.find(needle)
+              if pos < 0:
+                  # Public functions may be at column zero at the beginning of a chunk.
+                  pos = text.find(name + " (")
+              if pos < 0:
+                  raise SystemExit(f"cannot locate function {name}")
+              brace = text.find("{", pos)
+              if brace < 0:
+                  raise SystemExit(f"cannot locate opening brace for {name}")
+              depth = 0
+              end = None
+              for i in range(brace, len(text)):
+                  ch = text[i]
+                  if ch == "{":
+                      depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          break
+              if end is None:
+                  raise SystemExit(f"cannot locate closing brace for {name}")
+              block = text[pos:end]
+              for old, new, label in edits:
+                  if new in block:
+                      continue
+                  if old not in block:
+                      raise SystemExit(f"cannot locate {label} in {name}")
+                  block = block.replace(old, new, 1)
+              text = text[:pos] + block + text[end:]
+
+          # A small, switchable trace facility. This is intentionally limited to
+          # the kernel-assisted process-injection path so -p 0 remains readable.
+          replace_once(
+              '#define FRIDA_CONTROL_TOKEN 0x1d5f9e6b2c7a4038ULL\n',
+              '#define FRIDA_CONTROL_TOKEN 0x1d5f9e6b2c7a4038ULL\n'
+              '\n'
+              '#define FRIDA_INJECT_LOG(fmt, ...) \\\n'
+              '  do { if (frida_inject_debug) printk (KERN_INFO "frida-inject: " fmt "\\n", ##__VA_ARGS__); } while (0)\n',
+              'FRIDA_CONTROL_TOKEN'
+          )
+
+          replace_once(
+              'static rwlock_t * frida_tasklist_lock;\n'
+              'static struct task_struct * frida_op_worker;\n',
+              'static rwlock_t * frida_tasklist_lock;\n'
+              'static bool frida_process_ops_ready;\n'
+              'static bool frida_inject_debug = true;\n'
+              'module_param_named (inject_debug, frida_inject_debug, bool, 0644);\n'
+              'MODULE_PARM_DESC (inject_debug, "Enable Frida kernel-assisted injector stage logging");\n'
+              'static struct task_struct * frida_op_worker;\n',
+              'injector debug globals'
+          )
+
+          # CFI: these functions directly call kernel functions resolved at runtime
+          # through kallsyms/kprobes. Mark the call sites __nocfi instead of
+          # disabling CFI for the whole module.
+          signatures = [
+              ('u64\nfrida_kmod_process_alloc (', 'u64 __nocfi\nfrida_kmod_process_alloc ('),
+              ('int\nfrida_kmod_process_free (', 'int __nocfi\nfrida_kmod_process_free ('),
+              ('u64\nfrida_kmod_process_write (', 'u64 __nocfi\nfrida_kmod_process_write ('),
+              ('u64\nfrida_kmod_process_read (', 'u64 __nocfi\nfrida_kmod_process_read ('),
+              ('int\nfrida_kmod_process_spawn_thread (', 'int __nocfi\nfrida_kmod_process_spawn_thread ('),
+              ('static struct mm_struct *\nfrida_grab_process_mm (', 'static struct mm_struct * __nocfi\nfrida_grab_process_mm ('),
+              ('static struct task_struct *\nfrida_grab_process_leader (', 'static struct task_struct * __nocfi\nfrida_grab_process_leader ('),
+              ('static void\nfrida_reparent_into_group (', 'static void __nocfi\nfrida_reparent_into_group ('),
+              ('static void\nfrida_adopt_target_context (', 'static void __nocfi\nfrida_adopt_target_context ('),
+          ]
+          for old, new in signatures:
+              if new not in text:
+                  if old not in text:
+                      raise SystemExit(f"cannot locate signature: {old.splitlines()[-1]}")
+                  text = text.replace(old, new, 1)
+
+          # Resolve-time validation. Upstream 17.25.2 stores these pointers but
+          # does not validate them before the first app attach. A missing symbol
+          # should become -ENOSYS, not a NULL indirect call in the kernel.
+          old_resolve_tail = (
+              '  frida_signal_cachep = (struct kmem_cache **) frida_kmod_find_symbol ("signal_cachep");\n'
+              '  frida_tasklist_lock = (rwlock_t *) frida_kmod_find_symbol ("tasklist_lock");\n'
+          )
+          new_resolve_tail = old_resolve_tail + (
+              '\n'
+              '  frida_process_ops_ready = true;\n'
+              '#define FRIDA_REQUIRE_PROCESS_OP(op) \\\n'
+              '  do { \\\n'
+              '    if ((op) == NULL) \\\n'
+              '    { \\\n'
+              '      printk (KERN_ERR "frida-inject: missing required process op: %s\\n", #op); \\\n'
+              '      frida_process_ops_ready = false; \\\n'
+              '    } \\\n'
+              '  } while (0)\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_find_task_by_vpid_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_get_task_mm_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_mmput_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_kthread_use_mm_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_kthread_unuse_mm_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_vm_mmap_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_vm_munmap_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_user_mode_thread_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_detach_pid_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_free_pids_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_task_join_group_stop_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_cleanup_sighand_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_kmem_cache_free_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_put_files_struct_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_switch_task_namespaces_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_free_fs_struct_impl);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_signal_cachep);\n'
+              '  FRIDA_REQUIRE_PROCESS_OP (frida_tasklist_lock);\n'
+              '#undef FRIDA_REQUIRE_PROCESS_OP\n'
+              '\n'
+              '  FRIDA_INJECT_LOG ("process ops ready=%d", frida_process_ops_ready);\n'
+          )
+          replace_once(old_resolve_tail, new_resolve_tail, 'frida_resolve_process_ops() tail')
+
+          patch_function('frida_kmod_process_alloc', [
+              (
+                  '  struct mm_struct * mm;\n\n',
+                  '  struct mm_struct * mm;\n\n'
+                  '  FRIDA_INJECT_LOG ("ALLOC enter pid=%d size=%llu prot=0x%x", pid,\n'
+                  '      (unsigned long long) size, prot);\n\n',
+                  'ALLOC entry'
+              ),
+              (
+                  '  if (mm == NULL)\n    return 0;\n',
+                  '  if (mm == NULL)\n'
+                  '  {\n'
+                  '    FRIDA_INJECT_LOG ("ALLOC no-mm pid=%d", pid);\n'
+                  '    return 0;\n'
+                  '  }\n',
+                  'ALLOC mm failure'
+              ),
+              (
+                  '  frida_kthread_use_mm_impl (mm);\n'
+                  '  address = frida_vm_mmap_impl (NULL, 0, size, prot, MAP_ANONYMOUS | MAP_PRIVATE, 0);\n'
+                  '  frida_kthread_unuse_mm_impl (mm);\n',
+                  '  FRIDA_INJECT_LOG ("ALLOC before use-mm pid=%d", pid);\n'
+                  '  frida_kthread_use_mm_impl (mm);\n'
+                  '  FRIDA_INJECT_LOG ("ALLOC before vm_mmap pid=%d", pid);\n'
+                  '  address = frida_vm_mmap_impl (NULL, 0, size, prot, MAP_ANONYMOUS | MAP_PRIVATE, 0);\n'
+                  '  FRIDA_INJECT_LOG ("ALLOC after vm_mmap pid=%d result=0x%llx", pid,\n'
+                  '      (unsigned long long) address);\n'
+                  '  frida_kthread_unuse_mm_impl (mm);\n',
+                  'ALLOC mmap stage'
+              ),
+              (
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  return IS_ERR_VALUE (address) ? 0 : address;\n',
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  FRIDA_INJECT_LOG ("ALLOC done pid=%d", pid);\n'
+                  '  return IS_ERR_VALUE (address) ? 0 : address;\n',
+                  'ALLOC completion'
+              ),
+          ])
+
+          patch_function('frida_kmod_process_free', [
+              (
+                  '  struct mm_struct * mm;\n\n',
+                  '  struct mm_struct * mm;\n\n'
+                  '  FRIDA_INJECT_LOG ("FREE enter pid=%d address=0x%llx size=%llu", pid,\n'
+                  '      (unsigned long long) address, (unsigned long long) size);\n\n',
+                  'FREE entry'
+              ),
+              (
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  return result;\n',
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  FRIDA_INJECT_LOG ("FREE done pid=%d result=%d", pid, result);\n'
+                  '  return result;\n',
+                  'FREE completion'
+              ),
+          ])
+
+          patch_function('frida_kmod_process_write', [
+              (
+                  '  struct mm_struct * mm;\n\n',
+                  '  struct mm_struct * mm;\n\n'
+                  '  FRIDA_INJECT_LOG ("WRITE enter pid=%d address=0x%llx size=%llu", pid,\n'
+                  '      (unsigned long long) address, (unsigned long long) size);\n\n',
+                  'WRITE entry'
+              ),
+              (
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  return written;\n',
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  FRIDA_INJECT_LOG ("WRITE done pid=%d written=%llu", pid,\n'
+                  '      (unsigned long long) written);\n'
+                  '  return written;\n',
+                  'WRITE completion'
+              ),
+          ])
+
+          patch_function('frida_kmod_process_read', [
+              (
+                  '  struct mm_struct * mm;\n\n',
+                  '  struct mm_struct * mm;\n\n'
+                  '  FRIDA_INJECT_LOG ("READ enter pid=%d address=0x%llx size=%llu", pid,\n'
+                  '      (unsigned long long) address, (unsigned long long) size);\n\n',
+                  'READ entry'
+              ),
+              (
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  return read;\n',
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  FRIDA_INJECT_LOG ("READ done pid=%d read=%llu", pid,\n'
+                  '      (unsigned long long) read);\n'
+                  '  return read;\n',
+                  'READ completion'
+              ),
+          ])
+
+          patch_function('frida_kmod_process_spawn_thread', [
+              (
+                  '  struct frida_spawn_ctx * ctx;\n\n',
+                  '  struct frida_spawn_ctx * ctx;\n\n'
+                  '  FRIDA_INJECT_LOG ("SPAWN enter pid=%d entry=0x%llx stack=0x%llx tls=0x%llx", pid,\n'
+                  '      (unsigned long long) entry, (unsigned long long) stack,\n'
+                  '      (unsigned long long) tls);\n\n',
+                  'SPAWN entry'
+              ),
+              (
+                  '  mm = frida_grab_process_mm (pid);\n'
+                  '  if (mm == NULL)\n'
+                  '    return -ESRCH;\n',
+                  '  FRIDA_INJECT_LOG ("SPAWN before grab-mm pid=%d", pid);\n'
+                  '  mm = frida_grab_process_mm (pid);\n'
+                  '  if (mm == NULL)\n'
+                  '  {\n'
+                  '    FRIDA_INJECT_LOG ("SPAWN no-mm pid=%d", pid);\n'
+                  '    return -ESRCH;\n'
+                  '  }\n'
+                  '  FRIDA_INJECT_LOG ("SPAWN got-mm pid=%d", pid);\n',
+                  'SPAWN grab mm'
+              ),
+              (
+                  '  leader = frida_grab_process_leader (pid);\n'
+                  '  if (leader == NULL)\n',
+                  '  FRIDA_INJECT_LOG ("SPAWN before grab-leader pid=%d", pid);\n'
+                  '  leader = frida_grab_process_leader (pid);\n'
+                  '  if (leader == NULL)\n',
+                  'SPAWN grab leader'
+              ),
+              (
+                  '  ctx = kmalloc (sizeof (struct frida_spawn_ctx), GFP_KERNEL);\n'
+                  '  ctx->entry = entry;\n',
+                  '  FRIDA_INJECT_LOG ("SPAWN got-leader pid=%d leader=%d", pid, leader->pid);\n'
+                  '  ctx = kmalloc (sizeof (struct frida_spawn_ctx), GFP_KERNEL);\n'
+                  '  if (ctx == NULL)\n'
+                  '  {\n'
+                  '    FRIDA_INJECT_LOG ("SPAWN ctx allocation failed pid=%d", pid);\n'
+                  '    put_task_struct (leader);\n'
+                  '    frida_mmput_impl (mm);\n'
+                  '    return -ENOMEM;\n'
+                  '  }\n'
+                  '  ctx->entry = entry;\n',
+                  'SPAWN ctx allocation'
+              ),
+              (
+                  '  frida_kthread_use_mm_impl (mm);\n'
+                  '  tid = frida_user_mode_thread_impl (frida_spawn_trampoline, ctx, 0);\n'
+                  '  frida_kthread_unuse_mm_impl (mm);\n',
+                  '  FRIDA_INJECT_LOG ("SPAWN before use-mm pid=%d", pid);\n'
+                  '  frida_kthread_use_mm_impl (mm);\n'
+                  '  FRIDA_INJECT_LOG ("SPAWN before user_mode_thread pid=%d", pid);\n'
+                  '  tid = frida_user_mode_thread_impl (frida_spawn_trampoline, ctx, 0);\n'
+                  '  FRIDA_INJECT_LOG ("SPAWN after user_mode_thread pid=%d tid=%d", pid, tid);\n'
+                  '  frida_kthread_unuse_mm_impl (mm);\n',
+                  'SPAWN user_mode_thread'
+              ),
+              (
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  return tid;\n',
+                  '  frida_mmput_impl (mm);\n\n'
+                  '  FRIDA_INJECT_LOG ("SPAWN return pid=%d tid=%d", pid, tid);\n'
+                  '  return tid;\n',
+                  'SPAWN completion'
+              ),
+          ])
+
+          patch_function('frida_grab_process_mm', [
+              (
+                  '  rcu_read_lock ();\n'
+                  '  task = frida_find_task_by_vpid_impl (pid);\n',
+                  '  rcu_read_lock ();\n'
+                  '  task = frida_find_task_by_vpid_impl (pid);\n',
+                  'grab-mm callsite'
+              ),
+          ])
+
+          patch_function('frida_spawn_trampoline', [
+              (
+                  '  regs = task_pt_regs (current);\n\n',
+                  '  FRIDA_INJECT_LOG ("TRAMPOLINE enter tid=%d leader=%d", current->pid, ctx.leader->pid);\n'
+                  '  regs = task_pt_regs (current);\n\n',
+                  'trampoline entry'
+              ),
+              (
+                  '  frida_reparent_into_group (ctx.leader);\n'
+                  '  put_task_struct (ctx.leader);\n',
+                  '  FRIDA_INJECT_LOG ("TRAMPOLINE before reparent tid=%d", current->pid);\n'
+                  '  frida_reparent_into_group (ctx.leader);\n'
+                  '  FRIDA_INJECT_LOG ("TRAMPOLINE after reparent tid=%d tgid=%d", current->pid, current->tgid);\n'
+                  '  put_task_struct (ctx.leader);\n',
+                  'trampoline reparent stage'
+              ),
+              (
+                  '  return 0;\n',
+                  '  FRIDA_INJECT_LOG ("TRAMPOLINE regs-ready tid=%d entry=0x%llx stack=0x%llx", current->pid,\n'
+                  '      (unsigned long long) ctx.entry, (unsigned long long) ctx.stack);\n'
+                  '  return 0;\n',
+                  'trampoline completion'
+              ),
+          ])
+
+          patch_function('frida_reparent_into_group', [
+              (
+                  '  struct pid * freed[PIDTYPE_MAX] = { NULL };\n\n'
+                  '  write_lock_irq (frida_tasklist_lock);\n',
+                  '  struct pid * freed[PIDTYPE_MAX] = { NULL };\n\n'
+                  '  FRIDA_INJECT_LOG ("REPARENT enter child=%d leader=%d", child->pid, leader->pid);\n'
+                  '  FRIDA_INJECT_LOG ("REPARENT before tasklist-lock child=%d", child->pid);\n'
+                  '  write_lock_irq (frida_tasklist_lock);\n',
+                  'reparent entry'
+              ),
+              (
+                  '  write_unlock_irq (frida_tasklist_lock);\n\n'
+                  '  frida_free_pids_impl (freed);\n',
+                  '  write_unlock_irq (frida_tasklist_lock);\n'
+                  '  FRIDA_INJECT_LOG ("REPARENT after tasklist-unlock child=%d tgid=%d", child->pid, child->tgid);\n\n'
+                  '  frida_free_pids_impl (freed);\n'
+                  '  FRIDA_INJECT_LOG ("REPARENT after free_pids child=%d", child->pid);\n',
+                  'reparent unlock/free-pids'
+              ),
+              (
+                  '  frida_cleanup_sighand_impl (old_sighand);\n'
+                  '  if (refcount_dec_and_test (&old_signal->sigcnt))\n'
+                  '    frida_kmem_cache_free_impl (*frida_signal_cachep, old_signal);\n\n'
+                  '  frida_adopt_target_context (leader);\n',
+                  '  frida_cleanup_sighand_impl (old_sighand);\n'
+                  '  FRIDA_INJECT_LOG ("REPARENT after cleanup_sighand child=%d", child->pid);\n'
+                  '  if (refcount_dec_and_test (&old_signal->sigcnt))\n'
+                  '    frida_kmem_cache_free_impl (*frida_signal_cachep, old_signal);\n'
+                  '  FRIDA_INJECT_LOG ("REPARENT before adopt-context child=%d", child->pid);\n\n'
+                  '  frida_adopt_target_context (leader);\n'
+                  '  FRIDA_INJECT_LOG ("REPARENT done child=%d tgid=%d", child->pid, child->tgid);\n',
+                  'reparent cleanup/adopt'
+              ),
+          ])
+
+          patch_function('frida_adopt_target_context', [
+              (
+                  '  int fs_dead;\n',
+                  '  int fs_dead;\n'
+                  '  FRIDA_INJECT_LOG ("ADOPT enter child=%d leader=%d", current->pid, leader->pid);\n',
+                  'adopt entry'
+              ),
+              (
+                  '  frida_put_files_struct_impl (old_files);\n',
+                  '  frida_put_files_struct_impl (old_files);\n'
+                  '  FRIDA_INJECT_LOG ("ADOPT files-done child=%d", current->pid);\n',
+                  'adopt files'
+              ),
+              (
+                  '  if (fs_dead)\n'
+                  '    frida_free_fs_struct_impl (old_fs);\n',
+                  '  if (fs_dead)\n'
+                  '    frida_free_fs_struct_impl (old_fs);\n'
+                  '  FRIDA_INJECT_LOG ("ADOPT fs-done child=%d", current->pid);\n',
+                  'adopt fs'
+              ),
+              (
+                  '  put_cred (old_real_cred);\n\n'
+                  '  get_nsproxy (leader->nsproxy);\n',
+                  '  put_cred (old_real_cred);\n'
+                  '  FRIDA_INJECT_LOG ("ADOPT creds-done child=%d", current->pid);\n\n'
+                  '  get_nsproxy (leader->nsproxy);\n',
+                  'adopt creds'
+              ),
+              (
+                  '  frida_switch_task_namespaces_impl (current, leader->nsproxy);\n',
+                  '  frida_switch_task_namespaces_impl (current, leader->nsproxy);\n'
+                  '  FRIDA_INJECT_LOG ("ADOPT namespaces-done child=%d", current->pid);\n',
+                  'adopt namespaces'
+              ),
+          ])
+
+          # V7 may have CONFIG_SYSVIPC guards around the tail. Add a completion
+          # marker immediately before the function's closing brace using an exact
+          # guarded or unguarded tail.
+          adopt_guarded = (
+              '#ifdef CONFIG_SYSVIPC\n'
+              '  if (undo_list != NULL)\n'
+              '  {\n'
+              '    refcount_inc (&((struct frida_sem_undo_list *) undo_list)->refcnt);\n'
+              '    current->sysvsem.undo_list = undo_list;\n'
+              '  }\n'
+              '#endif\n'
+              '}\n'
+          )
+          adopt_guarded_new = (
+              '#ifdef CONFIG_SYSVIPC\n'
+              '  if (undo_list != NULL)\n'
+              '  {\n'
+              '    refcount_inc (&((struct frida_sem_undo_list *) undo_list)->refcnt);\n'
+              '    current->sysvsem.undo_list = undo_list;\n'
+              '  }\n'
+              '#endif\n'
+              '  FRIDA_INJECT_LOG ("ADOPT done child=%d", current->pid);\n'
+              '}\n'
+          )
+          if 'FRIDA_INJECT_LOG ("ADOPT done child=%d"' not in text:
+              if adopt_guarded in text:
+                  text = text.replace(adopt_guarded, adopt_guarded_new, 1)
+              else:
+                  raise SystemExit('cannot locate CONFIG_SYSVIPC adopt tail')
+
+          # Guard the prctl entrypoint so missing process symbols cannot become a
+          # NULL indirect call. Log only process operations, not cloak traffic.
+          patch_function('frida_sys_prctl', [
+              (
+                  '  if (op == FRIDA_CONTROL_OP_PING)\n'
+                  '    return FRIDA_CONTROL_MAGIC;\n\n'
+                  '  if (op >= FRIDA_PROCESS_OP_ALLOC && !capable (CAP_SYS_ADMIN))\n',
+                  '  if (op == FRIDA_CONTROL_OP_PING)\n'
+                  '    return FRIDA_CONTROL_MAGIC;\n\n'
+                  '  if (op >= FRIDA_PROCESS_OP_ALLOC && op <= FRIDA_PROCESS_OP_SPAWN)\n'
+                  '  {\n'
+                  '    FRIDA_INJECT_LOG ("PRCTL op=%lu caller-tgid=%d", op, current->tgid);\n'
+                  '    if (!frida_process_ops_ready)\n'
+                  '    {\n'
+                  '      printk (KERN_ERR "frida-inject: refusing process op %lu because required kernel symbols are missing\\n", op);\n'
+                  '      return -ENOSYS;\n'
+                  '    }\n'
+                  '  }\n\n'
+                  '  if (op >= FRIDA_PROCESS_OP_ALLOC && !capable (CAP_SYS_ADMIN))\n',
+                  'prctl process-op guard'
+              ),
+          ])
+
+          p.write_text(text)
+          PY_INJECT
+
+          echo "=== kernel-assisted injector patch verification ==="
+          grep -n 'frida-inject: process ops ready' "$FRIDA_KMOD"
+          grep -n 'frida-inject: missing required process op' "$FRIDA_KMOD"
+          grep -n -A10 -B3 'SPAWN before user_mode_thread' "$FRIDA_KMOD"
+          grep -n -A12 -B4 'REPARENT enter' "$FRIDA_KMOD"
+          grep -n -A16 -B4 'ADOPT enter' "$FRIDA_KMOD"
+          grep -n -E 'frida_kmod_process_(alloc|free|write|read|spawn_thread)|frida_reparent_into_group|frida_adopt_target_context' "$FRIDA_KMOD" | head -40
+
       - name: 编译 Frida Barebone frida-agent.ko
         run: |
           set -euxo pipefail
@@ -1267,6 +1744,46 @@ jobs:
           nm -u "$KO" || true
 
           echo
+          echo "=== injector debug markers ==="
+          strings "$KO" | grep -E 'frida-inject:|SPAWN before user_mode_thread|REPARENT enter|ADOPT enter' | head -80 || true
+
+          echo
+          echo "=== ELF section / RO_AFTER_INIT diagnostics ==="
+          readelf -SW "$KO" | grep -E '\.(bss|data|ro_after|init)' || true
+          python3 - "$KO" <<'PY_ELF_FLAGS'
+          import struct
+          import sys
+
+          path = sys.argv[1]
+          data = open(path, 'rb').read()
+          if data[:4] != b'\x7fELF' or data[4] != 2:
+              raise SystemExit(f'not ELF64: {path}')
+          endian = '<' if data[5] == 1 else '>'
+          e_shoff = struct.unpack_from(endian + 'Q', data, 0x28)[0]
+          e_shentsize = struct.unpack_from(endian + 'H', data, 0x3A)[0]
+          e_shnum = struct.unpack_from(endian + 'H', data, 0x3C)[0]
+          e_shstrndx = struct.unpack_from(endian + 'H', data, 0x3E)[0]
+          shstr_h = e_shoff + e_shstrndx * e_shentsize
+          shstr_off = struct.unpack_from(endian + 'Q', data, shstr_h + 0x18)[0]
+          shstr_size = struct.unpack_from(endian + 'Q', data, shstr_h + 0x20)[0]
+          shstr = data[shstr_off:shstr_off + shstr_size]
+          ro_after = 0x00200000
+          loaded = 0
+          for i in range(e_shnum):
+              h = e_shoff + i * e_shentsize
+              name_off = struct.unpack_from(endian + 'I', data, h)[0]
+              flags = struct.unpack_from(endian + 'Q', data, h + 8)[0]
+              size = struct.unpack_from(endian + 'Q', data, h + 0x20)[0]
+              if flags & 0x2:
+                  loaded += 1
+              end = shstr.find(b'\0', name_off)
+              name = shstr[name_off:end].decode(errors='replace') if end >= 0 else '?'
+              if name in ('.bss', '.data') or 'ro_after' in name:
+                  print(f'{name}: flags=0x{flags:x} size=0x{size:x} SHF_RO_AFTER_INIT={bool(flags & ro_after)}')
+          print(f'ELF section count={e_shnum}, loaded-section count={loaded}')
+          PY_ELF_FLAGS
+
+          echo
           echo "=== 准备 Frida Artifact ==="
 
           OUTPUT="$WORKDIR/frida-output"
@@ -1274,12 +1791,22 @@ jobs:
           mkdir -p "$OUTPUT"
 
           cp "$KO" "$OUTPUT/frida-agent.ko"
+          readelf -SW "$KO" > "$OUTPUT/frida-agent.sections.txt" || true
+          strings "$KO" | grep 'frida-inject:' > "$OUTPUT/frida-inject-markers.txt" || true
 
-          if [ -f "$FRIDA_DIR/src/barebone/agent/etc/linux-kmod.json" ]; then
-            cp \
-              "$FRIDA_DIR/src/barebone/agent/etc/linux-kmod.json" \
-              "$OUTPUT/linux-kmod.json"
-          fi
+          # Frida 17.25.2 server requires agent.type for a resident Barebone agent.
+          # Generate the known-good config instead of copying the incomplete upstream sample.
+          cat > "$OUTPUT/linux-kmod.json" <<'FRIDA_CONFIG_EOF'
+          {
+            "agent": {
+              "type": "resident",
+              "transport": {
+                "type": "device",
+                "path": "/dev/frida"
+              }
+            }
+          }
+          FRIDA_CONFIG_EOF
 
           if [ -f "$KOUT/.config" ]; then
             cp "$KOUT/.config" "$OUTPUT/kernel.config"
