@@ -423,8 +423,8 @@ jobs:
           # accesses it unconditionally. On Android GKI/OKI kernels with SYSVIPC
           # disabled, there is no semaphore undo-list state to inherit, so compile
           # that part only when the kernel actually provides the field.
-          old_decl = '  const struct cred * old_real_cred = current->real_cred;\n  void * undo_list = leader->sysvsem.undo_list;\n  int fs_dead;\n'
-          new_decl = '  const struct cred * old_real_cred = current->real_cred;\n#ifdef CONFIG_SYSVIPC\n  void * undo_list = leader->sysvsem.undo_list;\n#endif\n  int fs_dead;\n'
+          old_decl = '  void * undo_list = leader->sysvsem.undo_list;\n'
+          new_decl = '#ifdef CONFIG_SYSVIPC\n  void * undo_list = leader->sysvsem.undo_list;\n#endif\n'
           if new_decl not in text:
               if old_decl not in text:
                   raise SystemExit('cannot locate sysvsem declaration')
@@ -453,6 +453,103 @@ jobs:
           grep -n 'include "internal.h"' "$FRIDA_LINUX/frida-kmod.c"
           grep -n -A4 -B2 'undo_list = leader->sysvsem.undo_list' "$FRIDA_LINUX/frida-kmod.c"
           tail -n 8 "$FRIDA_LINUX/Kbuild"
+
+      - name: 修复内核注入线程的凭据和进程计数迁移
+        run: |
+          set -euo pipefail
+          export FRIDA_KMOD="$WORKDIR/frida-core/src/barebone/agent/linux/frida-kmod.c"
+
+          python3 <<'PY_UCOUNTS'
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["FRIDA_KMOD"])
+          text = p.read_text()
+          marker = 'MODULE_INFO (frida_context_compat, "ucounts-v1");'
+
+          if marker not in text:
+              replacements = [
+                  (
+                      '#include <linux/delay.h>\n',
+                      '#include <linux/cred.h>\n#include <linux/delay.h>\n#include <linux/user_namespace.h>\n',
+                  ),
+                  (
+                      'typedef void (* FridaFreeFsStructFunc) (struct fs_struct * fs);\n',
+                      'typedef void (* FridaFreeFsStructFunc) (struct fs_struct * fs);\n'
+                      'typedef __typeof__ (&get_task_cred) FridaGetTaskCredFunc;\n'
+                      'typedef __typeof__ (&inc_rlimit_ucounts) FridaIncRlimitUcountsFunc;\n'
+                      'typedef __typeof__ (&dec_rlimit_ucounts) FridaDecRlimitUcountsFunc;\n',
+                  ),
+                  (
+                      'static FridaFreeFsStructFunc frida_free_fs_struct_impl;\n',
+                      'static FridaFreeFsStructFunc frida_free_fs_struct_impl;\n'
+                      'static FridaGetTaskCredFunc frida_get_task_cred_impl;\n'
+                      'static FridaIncRlimitUcountsFunc frida_inc_rlimit_ucounts_impl;\n'
+                      'static FridaDecRlimitUcountsFunc frida_dec_rlimit_ucounts_impl;\n',
+                  ),
+                  (
+                      '  frida_free_fs_struct_impl = (FridaFreeFsStructFunc) frida_kmod_find_function ("free_fs_struct");\n',
+                      '  frida_free_fs_struct_impl = (FridaFreeFsStructFunc) frida_kmod_find_function ("free_fs_struct");\n'
+                      '  frida_get_task_cred_impl = (FridaGetTaskCredFunc) frida_kmod_find_function ("get_task_cred");\n'
+                      '  frida_inc_rlimit_ucounts_impl = (FridaIncRlimitUcountsFunc) frida_kmod_find_function ("inc_rlimit_ucounts");\n'
+                      '  frida_dec_rlimit_ucounts_impl = (FridaDecRlimitUcountsFunc) frida_kmod_find_function ("dec_rlimit_ucounts");\n',
+                  ),
+                  (
+                      '  struct frida_spawn_ctx * ctx;\n\n  mm = frida_grab_process_mm (pid);\n',
+                      '  struct frida_spawn_ctx * ctx;\n\n'
+                      '  if (frida_get_task_cred_impl == NULL ||\n'
+                      '      frida_inc_rlimit_ucounts_impl == NULL || frida_dec_rlimit_ucounts_impl == NULL)\n'
+                      '  {\n'
+                      '    pr_err_ratelimited ("frida: required credential/accounting functions are unavailable\\n");\n'
+                      '    return -EOPNOTSUPP;\n'
+                      '  }\n\n'
+                      '  mm = frida_grab_process_mm (pid);\n',
+                  ),
+                  (
+                      '  const struct cred * old_real_cred = current->real_cred;\n',
+                      '  const struct cred * old_real_cred = current->real_cred;\n'
+                      '  const struct cred * target_cred = frida_get_task_cred_impl (leader);\n'
+                      '  bool transfer_nproc = target_cred->ucounts != old_real_cred->ucounts;\n',
+                  ),
+                  (
+                      '  current->real_cred = get_cred (leader->real_cred);\n'
+                      '  rcu_assign_pointer (current->cred, get_cred (leader->cred));\n'
+                      '  put_cred (old_cred);\n'
+                      '  put_cred (old_real_cred);\n',
+                      '  /* copy_creds() charged this task to the kernel worker. Transfer that\n'
+                      '   * charge before adopting the target credentials, so release_task()\n'
+                      '   * decrements the same account. Do not use commit_creds() here: its\n'
+                      '   * privilege-drop handling would change the target mm dumpability. */\n'
+                      '  if (transfer_nproc)\n'
+                      '    frida_inc_rlimit_ucounts_impl (target_cred->ucounts, UCOUNT_RLIMIT_NPROC, 1);\n\n'
+                      '  rcu_assign_pointer (current->real_cred, target_cred);\n'
+                      '  rcu_assign_pointer (current->cred, get_cred (target_cred));\n\n'
+                      '  if (transfer_nproc)\n'
+                      '    frida_dec_rlimit_ucounts_impl (old_real_cred->ucounts, UCOUNT_RLIMIT_NPROC, 1);\n'
+                      '  put_cred (old_cred);\n'
+                      '  put_cred (old_real_cred);\n',
+                  ),
+              ]
+              for old, new in replacements:
+                  if text.count(old) != 1:
+                      raise SystemExit(f'cannot uniquely locate credential/accounting patch target: {old}')
+                  text = text.replace(old, new, 1)
+              text += '\n' + marker + '\n'
+
+          required = (
+              'frida_inc_rlimit_ucounts_impl (target_cred->ucounts, UCOUNT_RLIMIT_NPROC, 1);',
+              'frida_dec_rlimit_ucounts_impl (old_real_cred->ucounts, UCOUNT_RLIMIT_NPROC, 1);',
+              'rcu_assign_pointer (current->real_cred, target_cred);',
+          )
+          if any(text.count(needle) != 1 for needle in required):
+              raise SystemExit('credential/accounting patch verification failed')
+          if 'current->real_cred = get_cred (leader->real_cred);' in text:
+              raise SystemExit('unaccounted credential switch remains')
+          if text != p.read_text():
+              p.write_text(text)
+          PY_UCOUNTS
+
+          grep -n -A22 -B2 'copy_creds() charged' "$FRIDA_KMOD"
 
       - name: 修复 Frida Android FIFO 分配并增加运行时诊断
         run: |
@@ -645,6 +742,7 @@ jobs:
           VERMAGIC="$(modinfo -F vermagic "$KO")"
           test "${VERMAGIC%% *}" = "$EXPECTED_RELEASE"
           test "$(modinfo -F frida_compat "$KO")" = 'android6.6-pid-v1'
+          test "$(modinfo -F frida_context_compat "$KO")" = 'ucounts-v1'
           mkdir -p "$OUTPUT"
           cp "$KO" "$OUTPUT/frida-agent.ko"
           cp "$WORKDIR/frida-core/src/barebone/agent/etc/linux-kmod.json" "$OUTPUT/"
@@ -657,6 +755,7 @@ jobs:
             echo "Frida version: $FRIDA_VERSION"
             echo "Frida commit: $FRIDA_SHA"
             echo 'Frida compatibility: android6.6-pid-v1 (two-argument detach_pid, CFI enabled)'
+             echo 'Frida thread context: ucounts-v1 (balanced RLIMIT_NPROC credential transfer)'
             echo "Kernel release: $EXPECTED_RELEASE"
             echo "Kernel source: $KERNEL_REPO@$KERNEL_SHA"
             echo "Config SHA256: $(sha256sum "$KOUT/.config" | cut -d ' ' -f1)"
@@ -673,6 +772,10 @@ jobs:
           adb shell su -c 'insmod /data/local/tmp/frida-agent.ko'
           adb shell su -c 'ls -l /dev/frida'
           adb shell su -c 'dmesg | tail -100'
+            # 若旧模块已触发 dec_rlimit_ucounts 下溢及 pthread_create(EAGAIN)，
+            # 替换 .ko 不会重置 UID 的运行时计数；需重启后加载新模块再验收。
+            # 不加载任何兼容脚本，先验证 Java bridge 的原始初始化路径：
+            frida -H 127.0.0.1:27043 -f com.xingin.xhs -e 'Java.perform(() => console.log("Java ready"))'
           INSTALL_EOF
           (cd "$OUTPUT" && sha256sum frida-agent.ko > frida-agent.ko.sha256)
           {
@@ -681,6 +784,7 @@ jobs:
             echo "- Kernel dependency cache: ${{ steps.kernel-cache.outputs.cache-hit == 'true' && 'hit' || 'miss (generated)' }}"
             echo "- Compile cache: ${{ steps.compile-cache.outputs.cache-hit == 'true' && 'hit' || 'miss or fallback' }}"
             echo '- 唯一编译产物：frida-agent.ko；附带配置、符号表和诊断信息。'
+             echo '- 线程凭据补丁：ucounts-v1；迁移 RLIMIT_NPROC 计数，避免注入线程退出时扣错 UID。'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传 frida-agent.ko
