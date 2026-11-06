@@ -516,6 +516,51 @@ jobs:
 
           grep -n -A24 -B2 '^frida_kmod_on_module_state (' "$FRIDA_KMOD"
 
+      - name: 继承 Android arm64 带标签地址 ABI
+        run: |
+          set -euo pipefail
+          export FRIDA_KMOD="$WORKDIR/frida-core/src/barebone/agent/linux/frida-kmod.c"
+
+          python3 <<'PY_TAGGED_ADDR'
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["FRIDA_KMOD"])
+          text = p.read_text()
+          old = (
+              '  frida_reparent_into_group (ctx.leader);\n'
+              '  put_task_struct (ctx.leader);\n'
+          )
+          new = (
+              '  frida_reparent_into_group (ctx.leader);\n'
+              '#ifdef CONFIG_ARM64_TAGGED_ADDR_ABI\n'
+              '  /* user_mode_thread() inherits the kernel worker flags. Adopt the\n'
+              '   * target tagged-address ABI before entering userspace or creating\n'
+              '   * pthreads, otherwise ART futex calls on tagged pointers fail with\n'
+              '   * EFAULT. Keep all other task flags and MTE controls unchanged. */\n'
+              '  update_thread_flag (TIF_TAGGED_ADDR,\n'
+              '      test_tsk_thread_flag (ctx.leader, TIF_TAGGED_ADDR));\n'
+              '#endif\n'
+              '  put_task_struct (ctx.leader);\n'
+          )
+          if new not in text:
+              if text.count(old) != 1:
+                  raise SystemExit('cannot uniquely locate userspace thread ABI handoff')
+              text = text.replace(old, new, 1)
+          if text.count(new) != 1 or old in text:
+              raise SystemExit('tagged-address ABI handoff verification failed')
+
+          marker = 'MODULE_INFO (frida_thread_abi, "arm64-tagged-addr-v1");'
+          if marker not in text:
+              text += '\n' + marker + '\n'
+          if text.count(marker) != 1:
+              raise SystemExit('ambiguous thread ABI compatibility marker')
+          if text != p.read_text():
+              p.write_text(text)
+          PY_TAGGED_ADDR
+
+          grep -n -A13 -B2 'target tagged-address ABI' "$FRIDA_KMOD"
+
       - name: 修复内核注入线程的凭据和进程计数迁移
         run: |
           set -euo pipefail
@@ -806,6 +851,7 @@ jobs:
           test "$(modinfo -F frida_compat "$KO")" = 'android6.6-pid-v1'
           test "$(modinfo -F frida_context_compat "$KO")" = 'ucounts-v1'
           test "$(modinfo -F frida_callback_compat "$KO")" = 'module-notifier-cfi-v1'
+          test "$(modinfo -F frida_thread_abi "$KO")" = 'arm64-tagged-addr-v1'
           mkdir -p "$OUTPUT"
           cp "$KO" "$OUTPUT/frida-agent.ko"
           cp "$WORKDIR/frida-core/src/barebone/agent/etc/linux-kmod.json" "$OUTPUT/"
@@ -820,6 +866,7 @@ jobs:
             echo 'Frida compatibility: android6.6-pid-v1 (two-argument detach_pid, CFI enabled)'
              echo 'Frida thread context: ucounts-v1 (balanced RLIMIT_NPROC credential transfer)'
              echo 'Frida callback boundary: module-notifier-cfi-v1 (C/Rust notifier boundary only; kernel CFI retained)'
+             echo 'Frida thread ABI: arm64-tagged-addr-v1 (inherit target tagged-address ABI before userspace entry)'
             echo "Kernel release: $EXPECTED_RELEASE"
             echo "Kernel source: $KERNEL_REPO@$KERNEL_SHA"
             echo "Config SHA256: $(sha256sum "$KOUT/.config" | cut -d ' ' -f1)"
@@ -838,6 +885,8 @@ jobs:
           adb shell su -c 'dmesg | tail -100'
             # 用 modinfo -F frida_callback_compat frida-agent.ko 确认输出
             # module-notifier-cfi-v1；缺少该标记的旧产物仍可能在后续模块事件时 CFI panic。
+            # modinfo -F frida_thread_abi frida-agent.ko 应输出 arm64-tagged-addr-v1；
+            # 此补丁修复 ART futex 的 EFAULT，无需修改 JS 或禁用 JVMTI。
             # 若旧模块已触发 dec_rlimit_ucounts 下溢及 pthread_create(EAGAIN)，
             # 替换 .ko 不会重置 UID 的运行时计数；需重启后加载新模块再验收。
             # 不加载任何兼容脚本，先验证 Java bridge 的原始初始化路径：
@@ -852,6 +901,7 @@ jobs:
             echo '- 唯一编译产物：frida-agent.ko；附带配置、符号表和诊断信息。'
              echo '- 线程凭据补丁：ucounts-v1；迁移 RLIMIT_NPROC 计数，避免注入线程退出时扣错 UID。'
              echo '- 模块通知补丁：module-notifier-cfi-v1；修复 C 调用 Rust 模块事件回调时的 CFI panic。'
+             echo '- 线程 ABI 补丁：arm64-tagged-addr-v1；继承带标签地址 ABI，修复 ART futex 的 EFAULT。'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传 frida-agent.ko
