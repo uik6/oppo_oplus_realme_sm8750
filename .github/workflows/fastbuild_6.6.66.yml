@@ -352,6 +352,7 @@ jobs:
 
           python3 <<'PY_PATCH'
           import os
+          import re
           from pathlib import Path
 
           root = Path(os.environ["FRIDA_LINUX"])
@@ -359,6 +360,53 @@ jobs:
           kbuild = root / "Kbuild"
 
           text = src.read_text()
+
+          # Frida 17.25.2 assumes the newer detach_pid(freed, task, type) API.
+          # Android 6.6 uses detach_pid(task, type), which frees unused PIDs itself.
+          # Calling it with the newer prototype triggers a fatal CFI failure.
+          pid_header = Path(os.environ["WORKDIR"]) / "common/include/linux/pid.h"
+          legacy_detach = re.compile(
+              r"\bvoid\s+detach_pid\s*\(\s*struct\s+task_struct\s*\*\s*\w*\s*,"
+              r"\s*enum\s+pid_type\s*\w*\s*\)\s*;"
+          )
+          if not legacy_detach.search(pid_header.read_text()):
+              raise SystemExit('expected Android 6.6 two-argument detach_pid declaration')
+
+          pid_include = '#include <linux/pid.h>\n'
+          if pid_include not in text:
+              needle = '#include <linux/poll.h>\n'
+              if needle not in text:
+                  raise SystemExit('cannot locate linux/poll.h include')
+              text = text.replace(needle, pid_include + needle, 1)
+
+          typed_detach = 'typedef __typeof__ (&detach_pid) FridaDetachPidFunc;'
+          if typed_detach not in text:
+              replacements = [
+                  (
+                      'typedef void (* FridaDetachPidFunc) (struct pid ** pids, struct task_struct * task, enum pid_type type);',
+                      typed_detach,
+                  ),
+                  ('typedef void (* FridaFreePidsFunc) (struct pid ** pids);\n', ''),
+                  ('static FridaFreePidsFunc frida_free_pids_impl;\n', ''),
+                  ('  frida_free_pids_impl = (FridaFreePidsFunc) frida_kmod_find_function ("free_pids");\n', ''),
+                  ('  struct pid * freed[PIDTYPE_MAX] = { NULL };\n', ''),
+                  ('  frida_free_pids_impl (freed);\n', ''),
+              ]
+              for pid_type in ('SID', 'PGID', 'TGID'):
+                  replacements.append((
+                      f'  frida_detach_pid_impl (freed, child, PIDTYPE_{pid_type});',
+                      f'  frida_detach_pid_impl (child, PIDTYPE_{pid_type});',
+                  ))
+              for old, new in replacements:
+                  if text.count(old) != 1:
+                      raise SystemExit(f'cannot uniquely locate PID compatibility patch target: {old}')
+                  text = text.replace(old, new, 1)
+
+          if 'frida_free_pids_impl' in text or 'frida_detach_pid_impl (freed,' in text:
+              raise SystemExit('incompatible PID API remains after patch')
+          compat_info = 'MODULE_INFO (frida_compat, "android6.6-pid-v1");'
+          if compat_info not in text:
+              text += '\n' + compat_info + '\n'
 
           # Android/Linux 6.6 keeps the full struct kernel_symbol definition in
           # kernel/module/internal.h while linux/module.h only forward-declares it.
@@ -401,6 +449,7 @@ jobs:
           PY_PATCH
 
           echo "=== 验证 Frida 兼容补丁 ==="
+          grep -n -E 'FridaDetachPidFunc|frida_detach_pid_impl \(child|frida_compat' "$FRIDA_LINUX/frida-kmod.c"
           grep -n 'include "internal.h"' "$FRIDA_LINUX/frida-kmod.c"
           grep -n -A4 -B2 'undo_list = leader->sysvsem.undo_list' "$FRIDA_LINUX/frida-kmod.c"
           tail -n 8 "$FRIDA_LINUX/Kbuild"
@@ -595,6 +644,7 @@ jobs:
           EXPECTED_RELEASE="$(cat "$KOUT/include/config/kernel.release")"
           VERMAGIC="$(modinfo -F vermagic "$KO")"
           test "${VERMAGIC%% *}" = "$EXPECTED_RELEASE"
+          test "$(modinfo -F frida_compat "$KO")" = 'android6.6-pid-v1'
           mkdir -p "$OUTPUT"
           cp "$KO" "$OUTPUT/frida-agent.ko"
           cp "$WORKDIR/frida-core/src/barebone/agent/etc/linux-kmod.json" "$OUTPUT/"
@@ -606,6 +656,7 @@ jobs:
           {
             echo "Frida version: $FRIDA_VERSION"
             echo "Frida commit: $FRIDA_SHA"
+            echo 'Frida compatibility: android6.6-pid-v1 (two-argument detach_pid, CFI enabled)'
             echo "Kernel release: $EXPECTED_RELEASE"
             echo "Kernel source: $KERNEL_REPO@$KERNEL_SHA"
             echo "Config SHA256: $(sha256sum "$KOUT/.config" | cut -d ' ' -f1)"
@@ -616,7 +667,8 @@ jobs:
           } > "$OUTPUT/build-info.txt"
           cat > "$OUTPUT/install.txt" <<'INSTALL_EOF'
           # 目标设备的内核源码、配置和符号 CRC 必须与构建依赖匹配。
-          # 先用 adb shell uname -r 对照 kernel.release，不能只比较 6.6.66。
+          # 先用 adb shell cat /proc/sys/kernel/osrelease 对照 kernel.release。
+          # uname -r 可能被 SUSFS 改写，不能只比较 6.6.66 或修改后缀冒充 ABI 匹配。
           adb push frida-agent.ko /data/local/tmp/
           adb shell su -c 'insmod /data/local/tmp/frida-agent.ko'
           adb shell su -c 'ls -l /dev/frida'
