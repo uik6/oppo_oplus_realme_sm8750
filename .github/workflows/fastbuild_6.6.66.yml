@@ -35,8 +35,8 @@ env:
   KERNEL_NAME: android15-8-g29d86c5fc9dd-abogki428889875-4k
   KERNEL_CLANG_URL: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip
   FRIDA_VERSION: '17.25.2'
-  AGENT_MODULE_NAME: fage
-  AGENT_DEVICE_NAME: fage
+  AGENT_MODULE_NAME: adsp_mm
+  AGENT_DEVICE_NAME: adsp_mm
   RUSTUP_TOOLCHAIN: stable
   CARGO_INCREMENTAL: '0'
   CCACHE_MAXSIZE: 2G
@@ -365,7 +365,7 @@ jobs:
           # Normalize markers from an older patched source cache before applying
           # the idempotent compatibility patches below.
           for key in ("compat", "context_compat", "callback_compat", "thread_abi", "init_compat"):
-              text = text.replace(f'MODULE_INFO (frida_{key},', f'MODULE_INFO (fage_{key},')
+              text = text.replace(f'MODULE_INFO (frida_{key},', f'MODULE_INFO (mm_{key},')
 
           # Frida 17.25.2 assumes the newer detach_pid(freed, task, type) API.
           # Android 6.6 uses detach_pid(task, type), which frees unused PIDs itself.
@@ -410,7 +410,7 @@ jobs:
 
           if 'frida_free_pids_impl' in text or 'frida_detach_pid_impl (freed,' in text:
               raise SystemExit('incompatible PID API remains after patch')
-          compat_info = 'MODULE_INFO (fage_compat, "android6.6-pid-v1");'
+          compat_info = 'MODULE_INFO (mm_compat, "android6.6-pid-v1");'
           if compat_info not in text:
               text += '\n' + compat_info + '\n'
 
@@ -455,7 +455,7 @@ jobs:
           PY_PATCH
 
           echo "=== 验证 Frida 兼容补丁 ==="
-          grep -n -E 'FridaDetachPidFunc|frida_detach_pid_impl \(child|fage_compat' "$FRIDA_LINUX/frida-kmod.c"
+          grep -n -E 'FridaDetachPidFunc|frida_detach_pid_impl \(child|mm_compat' "$FRIDA_LINUX/frida-kmod.c"
           grep -n 'include "internal.h"' "$FRIDA_LINUX/frida-kmod.c"
           grep -n -A4 -B2 'undo_list = leader->sysvsem.undo_list' "$FRIDA_LINUX/frida-kmod.c"
           tail -n 8 "$FRIDA_LINUX/Kbuild"
@@ -511,7 +511,7 @@ jobs:
               if text.count(needle) != 1:
                   raise SystemExit(f'C/Rust callback boundary verification failed: {needle}')
 
-          marker = 'MODULE_INFO (fage_callback_compat, "module-notifier-cfi-v1");'
+          marker = 'MODULE_INFO (mm_callback_compat, "module-notifier-cfi-v1");'
           if marker not in text:
               text += '\n' + marker + '\n'
           if text.count(marker) != 1:
@@ -556,7 +556,7 @@ jobs:
           if text.count(new) != 1 or old in text:
               raise SystemExit('tagged-address ABI handoff verification failed')
 
-          marker = 'MODULE_INFO (fage_thread_abi, "arm64-tagged-addr-v1");'
+          marker = 'MODULE_INFO (mm_thread_abi, "arm64-tagged-addr-v1");'
           if marker not in text:
               text += '\n' + marker + '\n'
           if text.count(marker) != 1:
@@ -578,7 +578,7 @@ jobs:
 
           p = Path(os.environ["FRIDA_KMOD"])
           text = p.read_text()
-          marker = 'MODULE_INFO (fage_context_compat, "ucounts-v1");'
+          marker = 'MODULE_INFO (mm_context_compat, "ucounts-v1");'
 
           if marker not in text:
               replacements = [
@@ -875,8 +875,8 @@ jobs:
           if rust.count(inline_constructor_fn) != 1:
               raise SystemExit("ambiguous constructor iterator")
 
-          marker = 'MODULE_INFO (fage_init_compat, "module-init-constructors-v2");'
-          previous_marker = 'MODULE_INFO (fage_init_compat, "resident-init-array-v1");'
+          marker = 'MODULE_INFO (mm_init_compat, "module-init-constructors-v2");'
+          previous_marker = 'MODULE_INFO (mm_init_compat, "resident-init-array-v1");'
           code = source.read_text()
           if previous_marker in code:
               if code.count(previous_marker) != 1 or marker in code:
@@ -919,7 +919,7 @@ jobs:
           device = os.environ["AGENT_DEVICE_NAME"]
           if not re.fullmatch(r"[a-z][a-z0-9_]{0,14}", device):
               raise SystemExit("invalid fixed device name")
-          marker = 'MODULE_INFO (fage_cloak_compat, "hook-integrity-v1");'
+          marker = 'MODULE_INFO (mm_cloak_compat, "hook-integrity-v1");'
           hooks = (
               ("show_map", "show_map"),
               ("show_smap", "show_smap"),
@@ -1056,7 +1056,7 @@ jobs:
                               'MODULE_DESCRIPTION ("ARM64 runtime support");')
           code = code.replace('"frida: ', '"rt: ')
           rust = rust.replace('"frida: ', '"rt: ')
-          visibility = 'MODULE_INFO (fage_visibility, "visible-names-v1");'
+          visibility = 'MODULE_INFO (mm_visibility, "visible-names-v1");'
           if visibility not in code:
               code += '\n' + visibility + '\n'
           for needle in (marker, visibility, 'int frida_kmod_install_hooks (void);',
@@ -1078,7 +1078,267 @@ jobs:
           print(f"Fixed device: /dev/{device}; required hooks: {len(hooks)}; rollback enabled")
           PY_PROFILE
 
-      - name: 编译 fage.ko
+      - name: 增强隐藏（统计口径、map_files、模块表、sysfs 属性组、网络视图、线程名）
+        run: |
+          set -euo pipefail
+          export FRIDA_KMOD="$WORKDIR/frida-core/src/barebone/agent/linux/frida-kmod.c"
+                    echo 'LyoKICogRXh0ZW5kZWQgY29uY2VhbG1lbnQgZm9yIHRoZSByZXNpZGVudCBydW50aW1lLgogKgogKiBUaGUgY2xvYWsgdGFibGUgYWxyZWFkeSByZW1vdmVzIHBheWxvYWQgVk1BcyBmcm9tIG1hcHMvc21hcHMgYW5kIHRoZSBjb250cm9sCiAqIHRocmVhZCBmcm9tIHRhc2sgbGlzdGluZ3MuICBUaGlzIGJsb2NrIGNsb3NlcyB0aGUgcmVtYWluaW5nIHN0YXRpc3RpY2FsIGFuZAogKiBlbnVtZXJhdGlvbiBsZWFrczogc3RhdG0vc21hcHNfcm9sbHVwL251bWFfbWFwcywgbWFwX2ZpbGVzIGVudHJpZXMsIHRoZSBtb2R1bGUKICogdGFibGUsIHRoZSBtb2R1bGUgc3lzZnMgYXR0cmlidXRlIGdyb3VwIGFuZCB0aGUgc29ja2V0IHRhYmxlcy4KICovCgovKgogKiBwcm9jX21hcHNfcHJpdmF0ZSBoYXMgYSByYW5kb21pemVkIGZpZWxkIG9yZGVyLCBzbyB0aGUgbW0gY2Fubm90IGJlIHJlYWQgYXQgYQogKiBmaXhlZCBvZmZzZXQuICBJbnN0ZWFkIGxvb2sgZm9yIHRoZSBwb2ludGVyIHRoYXQgbWF0Y2hlcyBhIG1tIGFscmVhZHkgaGVsZCBieQogKiB0aGUgY2xvYWsgdGFibGU6IGFuIGV4YWN0IG1hdGNoIGNhbm5vdCBiZSBwcm9kdWNlZCBieSBhbnkgb3RoZXIgZmllbGQuCiAqLwpzdGF0aWMgYm9vbApmcmlkYV9jbG9ha19vd25zX21tIChjb25zdCB2b2lkICogY2FuZGlkYXRlKQp7CiAgYm9vbCBmb3VuZCA9IGZhbHNlOwogIHN0cnVjdCBmcmlkYV9jbG9hayAqIGM7CgogIHNwaW5fbG9jayAoJmZyaWRhX2Nsb2Frc19sb2NrKTsKICBsaXN0X2Zvcl9lYWNoX2VudHJ5IChjLCAmZnJpZGFfY2xvYWtzLCBub2RlKQogIHsKICAgIGlmIChjLT5tbSA9PSBjYW5kaWRhdGUpCiAgICB7CiAgICAgIGZvdW5kID0gdHJ1ZTsKICAgICAgZ290byBiZWFjaDsKICAgIH0KICB9CgpiZWFjaDoKICBzcGluX3VubG9jayAoJmZyaWRhX2Nsb2Frc19sb2NrKTsKCiAgcmV0dXJuIGZvdW5kOwp9CgpzdGF0aWMgc3RydWN0IG1tX3N0cnVjdCAqCmZyaWRhX21tX2Zyb21fc2VxIChzdHJ1Y3Qgc2VxX2ZpbGUgKiBtKQp7CiAgdW5zaWduZWQgaW50IGk7CiAgdm9pZCAqKiBzbG90czsKCiAgaWYgKG0gPT0gTlVMTCB8fCBtLT5wcml2YXRlID09IE5VTEwpCiAgICByZXR1cm4gTlVMTDsKCiAgc2xvdHMgPSAodm9pZCAqKikgbS0+cHJpdmF0ZTsKICBmb3IgKGkgPSAwOyBpICE9IDg7IGkrKykKICB7CiAgICB2b2lkICogY2FuZGlkYXRlID0gUkVBRF9PTkNFIChzbG90c1tpXSk7CgogICAgaWYgKGNhbmRpZGF0ZSAhPSBOVUxMICYmIGZyaWRhX2Nsb2FrX293bnNfbW0gKGNhbmRpZGF0ZSkpCiAgICAgIHJldHVybiAoc3RydWN0IG1tX3N0cnVjdCAqKSBjYW5kaWRhdGU7CiAgfQoKICByZXR1cm4gTlVMTDsKfQoKc3RhdGljIHVuc2lnbmVkIGxvbmcKZnJpZGFfY2xvYWtfaGlkZGVuX2J5dGVzIChzdHJ1Y3QgbW1fc3RydWN0ICogbW0pCnsKICB1bnNpZ25lZCBsb25nIHRvdGFsID0gMDsKICBzdHJ1Y3QgZnJpZGFfY2xvYWsgKiBjOwoKICBzcGluX2xvY2sgKCZmcmlkYV9jbG9ha3NfbG9jayk7CiAgbGlzdF9mb3JfZWFjaF9lbnRyeSAoYywgJmZyaWRhX2Nsb2Frcywgbm9kZSkKICB7CiAgICB1bnNpZ25lZCBpbnQgaTsKCiAgICBpZiAobW0gIT0gTlVMTCAmJiBjLT5tbSAhPSBtbSkKICAgICAgY29udGludWU7CiAgICBmb3IgKGkgPSAwOyBpICE9IGMtPm5fcmFuZ2VzOyBpKyspCiAgICAgIHRvdGFsICs9IGMtPnJhbmdlc1tpXS5lbmQgLSBjLT5yYW5nZXNbaV0uc3RhcnQ7CiAgfQogIHNwaW5fdW5sb2NrICgmZnJpZGFfY2xvYWtzX2xvY2spOwoKICByZXR1cm4gdG90YWw7Cn0KCnN0YXRpYyB2b2lkCmZyaWRhX3NlcV9zdWJ0cmFjdF9maWVsZCAoc3RydWN0IHNlcV9maWxlICogbSwKICAgICAgICAgICAgICAgICAgICAgICAgICBpbnQgaW5kZXgsCiAgICAgICAgICAgICAgICAgICAgICAgICAgdW5zaWduZWQgbG9uZyBhbW91bnQpCnsKICBzaXplX3QgaSA9IDAsIGJlZ2luLCBlbmQ7CiAgaW50IGZpZWxkID0gMDsKICB1bnNpZ25lZCBsb25nIHZhbHVlID0gMDsKICBjaGFyIHRtcFsyNF07CiAgaW50IG5sZW47CgogIGlmIChhbW91bnQgPT0gMCB8fCBtLT5jb3VudCA9PSAwIHx8IG0tPmJ1ZiA9PSBOVUxMKQogICAgcmV0dXJuOwoKICB3aGlsZSAoaSAhPSBtLT5jb3VudCAmJiBmaWVsZCAhPSBpbmRleCkKICB7CiAgICBpZiAobS0+YnVmW2ldID09ICcgJykKICAgICAgZmllbGQrKzsKICAgIGkrKzsKICB9CiAgaWYgKGZpZWxkICE9IGluZGV4IHx8IGkgPj0gbS0+Y291bnQpCiAgICByZXR1cm47CgogIGJlZ2luID0gaTsKICBlbmQgPSBpOwogIHdoaWxlIChlbmQgPCBtLT5jb3VudCAmJiBtLT5idWZbZW5kXSA+PSAnMCcgJiYgbS0+YnVmW2VuZF0gPD0gJzknKQogIHsKICAgIHZhbHVlID0gdmFsdWUgKiAxMCArIChtLT5idWZbZW5kXSAtICcwJyk7CiAgICBlbmQrKzsKICB9CiAgaWYgKGVuZCA9PSBiZWdpbikKICAgIHJldHVybjsKCiAgdmFsdWUgPSAodmFsdWUgPiBhbW91bnQpID8gdmFsdWUgLSBhbW91bnQgOiAwOwogIG5sZW4gPSBzbnByaW50ZiAodG1wLCBzaXplb2YgdG1wLCAiJWx1IiwgdmFsdWUpOwogIGlmIChubGVuIDw9IDApCiAgICByZXR1cm47CiAgaWYgKChzaXplX3QpIG5sZW4gIT0gZW5kIC0gYmVnaW4pCiAgewogICAgbWVtbW92ZSAobS0+YnVmICsgYmVnaW4gKyBubGVuLCBtLT5idWYgKyBlbmQsIG0tPmNvdW50IC0gZW5kKTsKICAgIG0tPmNvdW50ID0gbS0+Y291bnQgLSAoZW5kIC0gYmVnaW4pICsgbmxlbjsKICB9CiAgbWVtY3B5IChtLT5idWYgKyBiZWdpbiwgdG1wLCBubGVuKTsKfQoKc3RhdGljIHZvaWQKZnJpZGFfc2VxX3N1YnRyYWN0X2xhYmVsIChzdHJ1Y3Qgc2VxX2ZpbGUgKiBtLAogICAgICAgICAgICAgICAgICAgICAgICAgIGNvbnN0IGNoYXIgKiBsYWJlbCwKICAgICAgICAgICAgICAgICAgICAgICAgICB1bnNpZ25lZCBsb25nIGtiKQp7CiAgc2l6ZV90IGxhYmVsX2xlbiA9IHN0cmxlbiAobGFiZWwpOwogIHNpemVfdCBpID0gMDsKCiAgaWYgKGtiID09IDAgfHwgbS0+Y291bnQgPT0gMCB8fCBtLT5idWYgPT0gTlVMTCkKICAgIHJldHVybjsKCiAgd2hpbGUgKGkgKyBsYWJlbF9sZW4gPD0gbS0+Y291bnQpCiAgewogICAgc2l6ZV90IHAsIGVuZDsKICAgIHVuc2lnbmVkIGxvbmcgdmFsdWUgPSAwOwogICAgY2hhciB0bXBbMjRdOwogICAgaW50IG5sZW47CgogICAgaWYgKChpICE9IDAgJiYgbS0+YnVmW2kgLSAxXSAhPSAnXG4nKSB8fAogICAgICAgIG1lbWNtcCAobS0+YnVmICsgaSwgbGFiZWwsIGxhYmVsX2xlbikgIT0gMCkKICAgIHsKICAgICAgaSsrOwogICAgICBjb250aW51ZTsKICAgIH0KCiAgICBwID0gaSArIGxhYmVsX2xlbjsKICAgIHdoaWxlIChwIDwgbS0+Y291bnQgJiYgbS0+YnVmW3BdID09ICcgJykKICAgICAgcCsrOwogICAgZW5kID0gcDsKICAgIHdoaWxlIChlbmQgPCBtLT5jb3VudCAmJiBtLT5idWZbZW5kXSA+PSAnMCcgJiYgbS0+YnVmW2VuZF0gPD0gJzknKQogICAgewogICAgICB2YWx1ZSA9IHZhbHVlICogMTAgKyAobS0+YnVmW2VuZF0gLSAnMCcpOwogICAgICBlbmQrKzsKICAgIH0KICAgIGlmIChlbmQgPT0gcCkKICAgIHsKICAgICAgaSsrOwogICAgICBjb250aW51ZTsKICAgIH0KCiAgICB2YWx1ZSA9ICh2YWx1ZSA+IGtiKSA/IHZhbHVlIC0ga2IgOiAwOwogICAgbmxlbiA9IHNucHJpbnRmICh0bXAsIHNpemVvZiB0bXAsICIlbHUiLCB2YWx1ZSk7CiAgICBpZiAobmxlbiA8PSAwKQogICAgICByZXR1cm47CiAgICBpZiAoKHNpemVfdCkgbmxlbiAhPSBlbmQgLSBwKQogICAgewogICAgICBtZW1tb3ZlIChtLT5idWYgKyBwICsgbmxlbiwgbS0+YnVmICsgZW5kLCBtLT5jb3VudCAtIGVuZCk7CiAgICAgIG0tPmNvdW50ID0gbS0+Y291bnQgLSAoZW5kIC0gcCkgKyBubGVuOwogICAgfQogICAgbWVtY3B5IChtLT5idWYgKyBwLCB0bXAsIG5sZW4pOwogICAgaSA9IHAgKyBubGVuOwogIH0KfQoKc3RhdGljIGJvb2wKZnJpZGFfcGFyc2VfaGV4IChjb25zdCBjaGFyICoqIGN1cnNvciwKICAgICAgICAgICAgICAgICB1bnNpZ25lZCBsb25nICogdmFsdWUpCnsKICBjb25zdCBjaGFyICogcCA9ICpjdXJzb3I7CiAgdW5zaWduZWQgbG9uZyB2ID0gMDsKICB1bnNpZ25lZCBpbnQgZGlnaXRzID0gMDsKCiAgZm9yICg7OykKICB7CiAgICBpbnQgZDsKCiAgICBpZiAoKnAgPj0gJzAnICYmICpwIDw9ICc5JykKICAgICAgZCA9ICpwIC0gJzAnOwogICAgZWxzZSBpZiAoKnAgPj0gJ2EnICYmICpwIDw9ICdmJykKICAgICAgZCA9ICpwIC0gJ2EnICsgMTA7CiAgICBlbHNlIGlmICgqcCA+PSAnQScgJiYgKnAgPD0gJ0YnKQogICAgICBkID0gKnAgLSAnQScgKyAxMDsKICAgIGVsc2UKICAgICAgYnJlYWs7CgogICAgdiA9ICh2IDw8IDQpIHwgKHVuc2lnbmVkIGxvbmcpIGQ7CiAgICBwKys7CiAgICBkaWdpdHMrKzsKICB9CgogIGlmIChkaWdpdHMgPT0gMCkKICAgIHJldHVybiBmYWxzZTsKCiAgKmN1cnNvciA9IHA7CiAgKnZhbHVlID0gdjsKICByZXR1cm4gdHJ1ZTsKfQoKc3RhdGljIGJvb2wKZnJpZGFfY2xvYWtfaGFzX21hcF9maWxlc19yYW5nZSAoc3RydWN0IHRhc2tfc3RydWN0ICogdGFzaywKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY29uc3QgY2hhciAqIG5hbWUsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHVuc2lnbmVkIGludCBsZW4pCnsKICBjb25zdCBjaGFyICogY3Vyc29yOwogIGNvbnN0IGNoYXIgKiBsaW1pdDsKICB1bnNpZ25lZCBsb25nIHN0YXJ0LCBlbmQ7CgogIGlmICh0YXNrID09IE5VTEwgfHwgdGFzay0+bW0gPT0gTlVMTCB8fCBuYW1lID09IE5VTEwgfHwgbGVuID09IDApCiAgICByZXR1cm4gZmFsc2U7CgogIGN1cnNvciA9IG5hbWU7CiAgbGltaXQgPSBuYW1lICsgbGVuOwoKICBpZiAoIWZyaWRhX3BhcnNlX2hleCAoJmN1cnNvciwgJnN0YXJ0KSkKICAgIHJldHVybiBmYWxzZTsKICBpZiAoY3Vyc29yID49IGxpbWl0IHx8ICpjdXJzb3IgIT0gJy0nKQogICAgcmV0dXJuIGZhbHNlOwogIGN1cnNvcisrOwogIGlmICghZnJpZGFfcGFyc2VfaGV4ICgmY3Vyc29yLCAmZW5kKSkKICAgIHJldHVybiBmYWxzZTsKICBpZiAoY3Vyc29yICE9IGxpbWl0KQogICAgcmV0dXJuIGZhbHNlOwoKICByZXR1cm4gZnJpZGFfY2xvYWtfaGFzX3JhbmdlICh0YXNrLT5tbSwgc3RhcnQsIGVuZCk7Cn0KCnN0YXRpYyBpbnQgX19ub2NmaQpmcmlkYV9zaG93X3NtYXBzX3JvbGx1cCAoc3RydWN0IHNlcV9maWxlICogbSwKICAgICAgICAgICAgICAgICAgICAgICAgIHZvaWQgKiB2KQp7CiAgaW50IHJlc3VsdDsKICBzdHJ1Y3QgbW1fc3RydWN0ICogbW07CiAgdW5zaWduZWQgbG9uZyBrYjsKCiAgaWYgKGZyaWRhX3NtYXBzX3JvbGx1cF9vcmlnID09IE5VTEwpCiAgICByZXR1cm4gMDsKCiAgcmVzdWx0ID0gZnJpZGFfc21hcHNfcm9sbHVwX29yaWcgKG0sIHYpOwogIGlmIChyZXN1bHQgIT0gMCB8fCBmcmlkYV9yZWFkZXJfaXNfY2xvYWtlZCAoKSkKICAgIHJldHVybiByZXN1bHQ7CgogIG1tID0gZnJpZGFfbW1fZnJvbV9zZXEgKG0pOwogIGlmIChtbSA9PSBOVUxMKQogICAgcmV0dXJuIHJlc3VsdDsKCiAga2IgPSBmcmlkYV9jbG9ha19oaWRkZW5fYnl0ZXMgKG1tKSAvIDEwMjQ7CiAgaWYgKGtiID09IDApCiAgICByZXR1cm4gcmVzdWx0OwoKICBmcmlkYV9zZXFfc3VidHJhY3RfbGFiZWwgKG0sICJSc3M6Iiwga2IpOwogIGZyaWRhX3NlcV9zdWJ0cmFjdF9sYWJlbCAobSwgIlBzczoiLCBrYik7CiAgZnJpZGFfc2VxX3N1YnRyYWN0X2xhYmVsIChtLCAiQW5vbnltb3VzOiIsIGtiKTsKCiAgcmV0dXJuIHJlc3VsdDsKfQoKc3RhdGljIGludCBfX25vY2ZpCmZyaWRhX3Nob3dfbnVtYV9tYXAgKHN0cnVjdCBzZXFfZmlsZSAqIG0sCiAgICAgICAgICAgICAgICAgICAgIHZvaWQgKiB2KQp7CiAgc3RydWN0IHZtX2FyZWFfc3RydWN0ICogdm1hID0gdjsKCiAgaWYgKGZyaWRhX251bWFfbWFwX29yaWcgPT0gTlVMTCkKICAgIHJldHVybiAwOwogIGlmICh2bWEgPT0gTlVMTCB8fCB2bWEtPnZtX21tID09IE5VTEwpCiAgICByZXR1cm4gZnJpZGFfbnVtYV9tYXBfb3JpZyAobSwgdik7CiAgaWYgKGZyaWRhX3JlYWRlcl9pc19jbG9ha2VkICgpKQogICAgcmV0dXJuIGZyaWRhX251bWFfbWFwX29yaWcgKG0sIHYpOwogIGlmICghZnJpZGFfY2xvYWtfaGFzX3JhbmdlICh2bWEtPnZtX21tLCB2bWEtPnZtX3N0YXJ0LCB2bWEtPnZtX2VuZCkpCiAgICByZXR1cm4gZnJpZGFfbnVtYV9tYXBfb3JpZyAobSwgdik7CgogIHJldHVybiAwOwp9CgpzdGF0aWMgaW50IF9fbm9jZmkKZnJpZGFfcHJvY19waWRfc3RhdG0gKHN0cnVjdCBzZXFfZmlsZSAqIG0sCiAgICAgICAgICAgICAgICAgICAgICBzdHJ1Y3QgcGlkX25hbWVzcGFjZSAqIG5zLAogICAgICAgICAgICAgICAgICAgICAgc3RydWN0IHBpZCAqIHBpZCwKICAgICAgICAgICAgICAgICAgICAgIHN0cnVjdCB0YXNrX3N0cnVjdCAqIHRhc2spCnsKICBpbnQgcmVzdWx0OwogIHN0cnVjdCBtbV9zdHJ1Y3QgKiBtbTsKICB1bnNpZ25lZCBsb25nIHBhZ2VzOwoKICBpZiAoZnJpZGFfc3RhdG1fb3JpZyA9PSBOVUxMKQogICAgcmV0dXJuIDA7CgogIHJlc3VsdCA9IGZyaWRhX3N0YXRtX29yaWcgKG0sIG5zLCBwaWQsIHRhc2spOwogIGlmIChyZXN1bHQgIT0gMCB8fCBmcmlkYV9yZWFkZXJfaXNfY2xvYWtlZCAoKSB8fCB0YXNrID09IE5VTEwpCiAgICByZXR1cm4gcmVzdWx0OwogIGlmIChmcmlkYV9nZXRfdGFza19tbV9pbXBsID09IE5VTEwgfHwgZnJpZGFfbW1wdXRfaW1wbCA9PSBOVUxMKQogICAgcmV0dXJuIHJlc3VsdDsKCiAgbW0gPSBmcmlkYV9nZXRfdGFza19tbV9pbXBsICh0YXNrKTsKICBpZiAobW0gPT0gTlVMTCkKICAgIHJldHVybiByZXN1bHQ7CgogIHBhZ2VzID0gZnJpZGFfY2xvYWtfaGlkZGVuX2J5dGVzIChtbSkgLyBQQUdFX1NJWkU7CiAgZnJpZGFfbW1wdXRfaW1wbCAobW0pOwogIGlmIChwYWdlcyA9PSAwKQogICAgcmV0dXJuIHJlc3VsdDsKCiAgZnJpZGFfc2VxX3N1YnRyYWN0X2ZpZWxkIChtLCAwLCBwYWdlcyk7CiAgZnJpZGFfc2VxX3N1YnRyYWN0X2ZpZWxkIChtLCAxLCBwYWdlcyk7CgogIHJldHVybiByZXN1bHQ7Cn0KCnN0YXRpYyBpbnQgX19ub2NmaQpmcmlkYV9tb2R1bGVzX3Nob3cgKHN0cnVjdCBzZXFfZmlsZSAqIG0sCiAgICAgICAgICAgICAgICAgICAgdm9pZCAqIHYpCnsKICBzaXplX3Qgc3RhcnQsIG47CiAgaW50IHJlc3VsdDsKCiAgaWYgKGZyaWRhX21vZHVsZXNfc2hvd19vcmlnID09IE5VTEwpCiAgICByZXR1cm4gMDsKCiAgc3RhcnQgPSBtLT5jb3VudDsKICByZXN1bHQgPSBmcmlkYV9tb2R1bGVzX3Nob3dfb3JpZyAobSwgdik7CiAgaWYgKHJlc3VsdCAhPSAwIHx8IG0tPmNvdW50IDw9IHN0YXJ0IHx8IG0tPmJ1ZiA9PSBOVUxMKQogICAgcmV0dXJuIHJlc3VsdDsKCiAgbiA9IHNpemVvZiAoZnJpZGFfc2VsZl9tb2R1bGVfbmFtZSkgLSAxOwogIGlmIChtLT5jb3VudCA+IHN0YXJ0ICsgbiAmJgogICAgICBtZW1jbXAgKG0tPmJ1ZiArIHN0YXJ0LCBmcmlkYV9zZWxmX21vZHVsZV9uYW1lLCBuKSA9PSAwICYmCiAgICAgIG0tPmJ1ZltzdGFydCArIG5dID09ICcgJykKICAgIG0tPmNvdW50ID0gc3RhcnQ7CgogIHJldHVybiByZXN1bHQ7Cn0KCnN0YXRpYyBib29sCmZyaWRhX21vZHVsZV9pc19vdXJzIChzdHJ1Y3QgbW9kdWxlX2tvYmplY3QgKiBtaykKewogIGlmIChtayA9PSBOVUxMIHx8IG1rLT5tb2QgPT0gTlVMTCkKICAgIHJldHVybiBmYWxzZTsKCiAgcmV0dXJuIHN0cmNtcCAobWstPm1vZC0+bmFtZSwgZnJpZGFfc2VsZl9tb2R1bGVfbmFtZSkgPT0gMDsKfQoKc3RhdGljIHNzaXplX3QgX19ub2NmaQpmcmlkYV9tb2R1bGVfY29yZXNpemVfc2hvdyAoc3RydWN0IG1vZHVsZV9hdHRyaWJ1dGUgKiBtYXR0ciwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN0cnVjdCBtb2R1bGVfa29iamVjdCAqIG1rLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgY2hhciAqIGJ1ZikKewogIGlmIChmcmlkYV9tb2R1bGVfY29yZXNpemVfc2hvd19vcmlnID09IE5VTEwpCiAgICByZXR1cm4gMDsKICBpZiAoZnJpZGFfbW9kdWxlX2lzX291cnMgKG1rKSkKICAgIHJldHVybiAwOwoKICByZXR1cm4gZnJpZGFfbW9kdWxlX2NvcmVzaXplX3Nob3dfb3JpZyAobWF0dHIsIG1rLCBidWYpOwp9CgpzdGF0aWMgc3NpemVfdCBfX25vY2ZpCmZyaWRhX21vZHVsZV9pbml0c2l6ZV9zaG93IChzdHJ1Y3QgbW9kdWxlX2F0dHJpYnV0ZSAqIG1hdHRyLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgc3RydWN0IG1vZHVsZV9rb2JqZWN0ICogbWssCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBjaGFyICogYnVmKQp7CiAgaWYgKGZyaWRhX21vZHVsZV9pbml0c2l6ZV9zaG93X29yaWcgPT0gTlVMTCkKICAgIHJldHVybiAwOwogIGlmIChmcmlkYV9tb2R1bGVfaXNfb3VycyAobWspKQogICAgcmV0dXJuIDA7CgogIHJldHVybiBmcmlkYV9tb2R1bGVfaW5pdHNpemVfc2hvd19vcmlnIChtYXR0ciwgbWssIGJ1Zik7Cn0KCnN0YXRpYyBzc2l6ZV90IF9fbm9jZmkKZnJpZGFfbW9kdWxlX3RhaW50X3Nob3cgKHN0cnVjdCBtb2R1bGVfYXR0cmlidXRlICogbWF0dHIsCiAgICAgICAgICAgICAgICAgICAgICAgICBzdHJ1Y3QgbW9kdWxlX2tvYmplY3QgKiBtaywKICAgICAgICAgICAgICAgICAgICAgICAgIGNoYXIgKiBidWYpCnsKICBpZiAoZnJpZGFfbW9kdWxlX3RhaW50X3Nob3dfb3JpZyA9PSBOVUxMKQogICAgcmV0dXJuIDA7CiAgaWYgKGZyaWRhX21vZHVsZV9pc19vdXJzIChtaykpCiAgICByZXR1cm4gMDsKCiAgcmV0dXJuIGZyaWRhX21vZHVsZV90YWludF9zaG93X29yaWcgKG1hdHRyLCBtaywgYnVmKTsKfQoKc3RhdGljIHNzaXplX3QgX19ub2NmaQpmcmlkYV9tb2R1bGVfc2VjdF9yZWFkIChzdHJ1Y3QgZmlsZSAqIGZpbGUsCiAgICAgICAgICAgICAgICAgICAgICAgIHN0cnVjdCBrb2JqZWN0ICoga29iaiwKICAgICAgICAgICAgICAgICAgICAgICAgc3RydWN0IGJpbl9hdHRyaWJ1dGUgKiBiYXR0ciwKICAgICAgICAgICAgICAgICAgICAgICAgY2hhciAqIGJ1ZiwKICAgICAgICAgICAgICAgICAgICAgICAgbG9mZl90IHBvcywKICAgICAgICAgICAgICAgICAgICAgICAgc2l6ZV90IGNvdW50KQp7CiAgc3RydWN0IG1vZHVsZV9rb2JqZWN0ICogbWs7CgogIGlmIChmcmlkYV9tb2R1bGVfc2VjdF9yZWFkX29yaWcgPT0gTlVMTCB8fCBrb2JqID09IE5VTEwpCiAgICByZXR1cm4gMDsKCiAgbWsgPSBjb250YWluZXJfb2YgKGtvYmosIHN0cnVjdCBtb2R1bGVfa29iamVjdCwga29iaik7CiAgaWYgKGZyaWRhX21vZHVsZV9pc19vdXJzIChtaykpCiAgICByZXR1cm4gMDsKCiAgcmV0dXJuIGZyaWRhX21vZHVsZV9zZWN0X3JlYWRfb3JpZyAoZmlsZSwga29iaiwgYmF0dHIsIGJ1ZiwgcG9zLCBjb3VudCk7Cn0KCnN0YXRpYyBpbnQKZnJpZGFfbmV0X2Ryb3BfcG9ydCAoc3RydWN0IHNlcV9maWxlICogbSwKICAgICAgICAgICAgICAgICAgICAgc2l6ZV90IHN0YXJ0LAogICAgICAgICAgICAgICAgICAgICBpbnQgcmVzdWx0KQp7CiAgdW5zaWduZWQgaW50IHBvcnQgPSBSRUFEX09OQ0UgKGZyaWRhX2hpZGRlbl9wb3J0KTsKICBjaGFyIG5lZWRsZVs4XTsKICBpbnQgbGVuOwogIHNpemVfdCBpOwoKICBpZiAocG9ydCA9PSAwIHx8IHJlc3VsdCAhPSAwIHx8IG0tPmJ1ZiA9PSBOVUxMIHx8IHN0YXJ0ID49IG0tPmNvdW50KQogICAgcmV0dXJuIHJlc3VsdDsKCiAgbGVuID0gc25wcmludGYgKG5lZWRsZSwgc2l6ZW9mIG5lZWRsZSwgIjolMDRYIiwgcG9ydCk7CiAgaWYgKGxlbiA8PSAwKQogICAgcmV0dXJuIHJlc3VsdDsKCiAgZm9yIChpID0gc3RhcnQ7IGkgKyAoc2l6ZV90KSBsZW4gPD0gbS0+Y291bnQ7IGkrKykKICB7CiAgICBpZiAobWVtY21wIChtLT5idWYgKyBpLCBuZWVkbGUsIGxlbikgPT0gMCkKICAgIHsKICAgICAgbS0+Y291bnQgPSBzdGFydDsKICAgICAgYnJlYWs7CiAgICB9CiAgfQoKICByZXR1cm4gcmVzdWx0Owp9CgpzdGF0aWMgaW50IF9fbm9jZmkKZnJpZGFfdGNwNF9zaG93IChzdHJ1Y3Qgc2VxX2ZpbGUgKiBtLCB2b2lkICogdikKewogIHNpemVfdCBzdGFydCA9IG0tPmNvdW50OwogIHJldHVybiBmcmlkYV9uZXRfZHJvcF9wb3J0IChtLCBzdGFydCwgZnJpZGFfdGNwNF9zaG93X29yaWcgKG0sIHYpKTsKfQoKc3RhdGljIGludCBfX25vY2ZpCmZyaWRhX3RjcDZfc2hvdyAoc3RydWN0IHNlcV9maWxlICogbSwgdm9pZCAqIHYpCnsKICBzaXplX3Qgc3RhcnQgPSBtLT5jb3VudDsKICByZXR1cm4gZnJpZGFfbmV0X2Ryb3BfcG9ydCAobSwgc3RhcnQsIGZyaWRhX3RjcDZfc2hvd19vcmlnIChtLCB2KSk7Cn0KCnN0YXRpYyBpbnQgX19ub2NmaQpmcmlkYV91ZHA0X3Nob3cgKHN0cnVjdCBzZXFfZmlsZSAqIG0sIHZvaWQgKiB2KQp7CiAgc2l6ZV90IHN0YXJ0ID0gbS0+Y291bnQ7CiAgcmV0dXJuIGZyaWRhX25ldF9kcm9wX3BvcnQgKG0sIHN0YXJ0LCBmcmlkYV91ZHA0X3Nob3dfb3JpZyAobSwgdikpOwp9CgpzdGF0aWMgaW50IF9fbm9jZmkKZnJpZGFfdWRwNl9zaG93IChzdHJ1Y3Qgc2VxX2ZpbGUgKiBtLCB2b2lkICogdikKewogIHNpemVfdCBzdGFydCA9IG0tPmNvdW50OwogIHJldHVybiBmcmlkYV9uZXRfZHJvcF9wb3J0IChtLCBzdGFydCwgZnJpZGFfdWRwNl9zaG93X29yaWcgKG0sIHYpKTsKfQoKLyogL3Byb2MvZGV2aWNlcyBsaXN0cyB0aGUgbWlzYyBtaW5vci9uYW1lIHBhaXI7IGRyb3Agb3VyIG93biBub2RlLiAqLwpzdGF0aWMgaW50IF9fbm9jZmkKZnJpZGFfbWlzY19zaG93IChzdHJ1Y3Qgc2VxX2ZpbGUgKiBtLCB2b2lkICogdikKewogIHN0cnVjdCBtaXNjZGV2aWNlICogcDsKCiAgaWYgKGZyaWRhX21pc2Nfc2hvd19vcmlnID09IE5VTEwpCiAgICByZXR1cm4gMDsKICBpZiAodiA9PSBOVUxMKQogICAgcmV0dXJuIGZyaWRhX21pc2Nfc2hvd19vcmlnIChtLCB2KTsKCiAgcCA9IGxpc3RfZW50cnkgKHYsIHN0cnVjdCBtaXNjZGV2aWNlLCBsaXN0KTsKICBpZiAocCAhPSAmZnJpZGFfZGV2KQogICAgcmV0dXJuIGZyaWRhX21pc2Nfc2hvd19vcmlnIChtLCB2KTsKCiAgcmV0dXJuIDA7Cn0KCi8qCiAqIGluc21vZCBsZWF2ZXMgZm9yY2VkL3Vuc2lnbmVkL291dC1vZi10cmVlIGJpdHMgaW4gdGhlIGdsb2JhbCB0YWludCBtYXNrIGV2ZW4KICogd2hlbiB0aGUgbW9kdWxlIGhpZGVzIGl0c2VsZi4gIFNjcnViIG9ubHkgdGhvc2UgdGhyZWUgYml0cyBvbmNlIG91ciBob29rcyBhcmUKICogbGl2ZSBzbyB1bnJlbGF0ZWQgdGFpbnRzIHN0YXkgaW50YWN0LgogKi8Kc3RhdGljIHZvaWQKZnJpZGFfZm9yZ2V0X21vZHVsZV90YWludCAodm9pZCkKewogIHVuc2lnbmVkIGxvbmcgKiBtYXNrID0gKHVuc2lnbmVkIGxvbmcgKikgKHVpbnRwdHJfdCkgZnJpZGFfa21vZF9maW5kX3N5bWJvbCAoInRhaW50ZWRfbWFzayIpOwoKICBpZiAobWFzayA9PSBOVUxMKQogICAgcmV0dXJuOwoKICAvKiAxID0gZm9yY2VkIG1vZHVsZSwgMTIgPSB1bnNpZ25lZCBtb2R1bGUsIDEzID0gb3V0LW9mLXRyZWUgbW9kdWxlLiAqLwogIGNsZWFyX2JpdCAoMSwgbWFzayk7CiAgY2xlYXJfYml0ICgxMiwgbWFzayk7CiAgY2xlYXJfYml0ICgxMywgbWFzayk7Cn0K' | base64 -d > "$WORKDIR/hide-impl.c"
+          export HIDE_IMPL="$WORKDIR/hide-impl.c"
+
+          python3 <<'PY_HIDE'
+          import os
+          from pathlib import Path
+
+          p = Path(os.environ["FRIDA_KMOD"])
+          text = p.read_text()
+          module_name = os.environ.get("AGENT_MODULE_NAME", "adsp_rpc")
+
+          decl_anchor = "static void frida_remove_cloak_hooks (void);\n"
+          decls = (
+              "static bool frida_cloak_owns_mm (const void * candidate);\n"
+              "static struct mm_struct * frida_mm_from_seq (struct seq_file * m);\n"
+              "static unsigned long frida_cloak_hidden_bytes (struct mm_struct * mm);\n"
+              "static void frida_seq_subtract_field (struct seq_file * m, int index,\n"
+              "    unsigned long amount);\n"
+              "static void frida_seq_subtract_label (struct seq_file * m, const char * label,\n"
+              "    unsigned long kb);\n"
+              "static bool frida_parse_hex (const char ** cursor, unsigned long * value);\n"
+              "static bool frida_cloak_has_map_files_range (struct task_struct * task,\n"
+              "    const char * name, unsigned int len);\n"
+              "static int frida_show_smaps_rollup (struct seq_file * m, void * v);\n"
+              "static int frida_show_numa_map (struct seq_file * m, void * v);\n"
+              "static int frida_proc_pid_statm (struct seq_file * m, struct pid_namespace * ns,\n"
+              "    struct pid * pid, struct task_struct * task);\n"
+              "static int frida_modules_show (struct seq_file * m, void * v);\n"
+              "static bool frida_module_is_ours (struct module_kobject * mk);\n"
+              "static ssize_t frida_module_coresize_show (struct module_attribute * mattr,\n"
+              "    struct module_kobject * mk, char * buf);\n"
+              "static ssize_t frida_module_initsize_show (struct module_attribute * mattr,\n"
+              "    struct module_kobject * mk, char * buf);\n"
+              "static ssize_t frida_module_taint_show (struct module_attribute * mattr,\n"
+              "    struct module_kobject * mk, char * buf);\n"
+              "static ssize_t frida_module_sect_read (struct file * file, struct kobject * kobj,\n"
+              "    struct bin_attribute * battr, char * buf, loff_t pos, size_t count);\n"
+              "static int frida_net_drop_port (struct seq_file * m, size_t start, int result);\n"
+              "static int frida_tcp4_show (struct seq_file * m, void * v);\n"
+              "static int frida_tcp6_show (struct seq_file * m, void * v);\n"
+              "static int frida_udp4_show (struct seq_file * m, void * v);\n"
+              "static int frida_udp6_show (struct seq_file * m, void * v);\n"
+              "static void frida_forget_module_taint (void);\n"
+              "static int frida_misc_show (struct seq_file * m, void * v);\n"
+          )
+          if "frida_show_smaps_rollup (struct seq_file" not in text:
+              assert text.count(decl_anchor) == 1, "declaration anchor"
+              text = text.replace(decl_anchor, decl_anchor + decls, 1)
+
+          state_anchor = "static bool frida_link_registered;\n"
+          state = (
+              "static unsigned int frida_hidden_port;\n"
+              "static const char frida_self_module_name[] = \"" + module_name + "\";\n"
+              "static void * frida_proc_map_files_instantiate_addr;\n"
+              "static int (* frida_smaps_rollup_orig) (struct seq_file * m, void * v);\n"
+              "static int (* frida_numa_map_orig) (struct seq_file * m, void * v);\n"
+              "static int (* frida_statm_orig) (struct seq_file * m, struct pid_namespace * ns,\n"
+              "    struct pid * pid, struct task_struct * task);\n"
+              "static int (* frida_modules_show_orig) (struct seq_file * m, void * v);\n"
+              "static ssize_t (* frida_module_coresize_show_orig) (struct module_attribute * mattr,\n"
+              "    struct module_kobject * mk, char * buf);\n"
+              "static ssize_t (* frida_module_initsize_show_orig) (struct module_attribute * mattr,\n"
+              "    struct module_kobject * mk, char * buf);\n"
+              "static ssize_t (* frida_module_taint_show_orig) (struct module_attribute * mattr,\n"
+              "    struct module_kobject * mk, char * buf);\n"
+              "static ssize_t (* frida_module_sect_read_orig) (struct file * file,\n"
+              "    struct kobject * kobj, struct bin_attribute * battr, char * buf,\n"
+              "    loff_t pos, size_t count);\n"
+              "static int (* frida_tcp4_show_orig) (struct seq_file * m, void * v);\n"
+              "static int (* frida_tcp6_show_orig) (struct seq_file * m, void * v);\n"
+              "static int (* frida_udp4_show_orig) (struct seq_file * m, void * v);\n"
+              "static int (* frida_udp6_show_orig) (struct seq_file * m, void * v);\n"
+              "static int (* frida_misc_show_orig) (struct seq_file * m, void * v);\n"
+              "static void * frida_smaps_rollup_addr;\n"
+              "static void * frida_numa_map_addr;\n"
+              "static void * frida_statm_addr;\n"
+              "static void * frida_modules_show_addr;\n"
+              "static void * frida_module_coresize_addr;\n"
+              "static void * frida_module_initsize_addr;\n"
+              "static void * frida_module_taint_addr;\n"
+              "static void * frida_module_sect_read_addr;\n"
+              "static void * frida_tcp4_show_addr;\n"
+              "static void * frida_tcp6_show_addr;\n"
+              "static void * frida_udp4_show_addr;\n"
+              "static void * frida_udp6_show_addr;\n"
+              "static void * frida_misc_show_addr;\n"
+          )
+          if "frida_smaps_rollup_orig" not in text:
+              assert text.count(state_anchor) == 1, "state anchor"
+              text = text.replace(state_anchor, state_anchor + state, 1)
+
+          text = text.replace('"rt-control"', '"kworker/u16:4"')
+          text = text.replace('"rt-worker"', '"kworker/u16:3"')
+          text = text.replace('"rt: ', '"kernel: ')
+          text = text.replace('"frida: ', '"kernel: ')
+          text = text.replace('KERN_INFO "kernel: listening on /dev/%s',
+              'KERN_DEBUG "kernel: device ready for /dev/%s')
+
+          include_anchor = "#include <linux/module.h>\n"
+          includes = (
+              "#include <linux/bitops.h>\n"
+              "#include <linux/kobject.h>\n"
+              "#include <linux/sysfs.h>\n"
+          )
+          if "linux/bitops.h" not in text:
+              assert text.count(include_anchor) == 1, "include anchor"
+              text = text.replace(include_anchor, include_anchor + includes, 1)
+
+          old_param = "module_param_named (hooks_ready, frida_hooks_ready, bool, 0444);"
+          new_param = (
+              "module_param_named (enabled, frida_hooks_ready, bool, 0444);\n"
+              "module_param_named (poll_interval, frida_hidden_port, uint, 0200);")
+          if "module_param_named (enabled" not in text:
+              assert text.count(old_param) == 1, "parameter anchor"
+              text = text.replace(old_param, new_param, 1)
+
+          lookup_anchor = '  frida_show_map_addr = (void *) frida_kmod_find_symbol ("show_map");\n'
+          lookup_extra = (
+              '  frida_proc_map_files_instantiate_addr = (void *) frida_kmod_find_symbol ("proc_map_files_instantiate");\n'
+              '  frida_smaps_rollup_addr = (void *) frida_kmod_find_symbol ("show_smaps_rollup");\n'
+              '  frida_numa_map_addr = (void *) frida_kmod_find_symbol ("show_numa_map");\n'
+              '  frida_statm_addr = (void *) frida_kmod_find_symbol ("proc_pid_statm");\n'
+              '  frida_modules_show_addr = (void *) frida_kmod_find_symbol ("m_show");\n'
+              '  frida_module_coresize_addr = (void *) frida_kmod_find_symbol ("show_coresize");\n'
+              '  frida_module_initsize_addr = (void *) frida_kmod_find_symbol ("show_initsize");\n'
+              '  frida_module_taint_addr = (void *) frida_kmod_find_symbol ("show_taint");\n'
+              '  frida_module_sect_read_addr = (void *) frida_kmod_find_symbol ("module_sect_read");\n'
+              '  frida_tcp4_show_addr = (void *) frida_kmod_find_symbol ("tcp4_seq_show");\n'
+              '  frida_tcp6_show_addr = (void *) frida_kmod_find_symbol ("tcp6_seq_show");\n'
+              '  frida_udp4_show_addr = (void *) frida_kmod_find_symbol ("udp4_seq_show");\n'
+              '  frida_udp6_show_addr = (void *) frida_kmod_find_symbol ("udp6_seq_show");\n'
+              '  frida_misc_show_addr = (void *) frida_kmod_find_symbol ("misc_seq_show");\n'
+          )
+          if "frida_smaps_rollup_addr = (void *)" not in text:
+              assert text.count(lookup_anchor) == 1, "lookup anchor"
+              text = text.replace(lookup_anchor, lookup_anchor + lookup_extra, 1)
+
+          map_files_anchor = ("  return frida_proc_fill_cache_orig (file, ctx, name, len, instantiate, task, ptr);\n"
+                              "}\n")
+          map_files_branch = (
+              "  else if (instantiate == frida_proc_map_files_instantiate_addr)\n"
+              "  {\n"
+              "    if (frida_cloak_has_map_files_range (task, name, len))\n"
+              "      return true;\n"
+              "  }\n"
+              "  return frida_proc_fill_cache_orig (file, ctx, name, len, instantiate, task, ptr);\n"
+              "}\n"
+          )
+          if "frida_cloak_has_map_files_range (task, name, len)" not in text:
+              assert text.count(map_files_anchor) == 1, "map_files anchor"
+              text = text.replace(map_files_anchor, map_files_branch, 1)
+
+          hook_anchor = ("  gum_interceptor_end_transaction (frida_interceptor);\n"
+                         "  WRITE_ONCE (frida_hooks_ready, true);\n")
+          hook_extra = (
+              "  if (frida_smaps_rollup_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_smaps_rollup_addr,\n"
+              "        frida_show_smaps_rollup, &frida_smaps_rollup_orig, NULL);\n"
+              "  if (frida_numa_map_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_numa_map_addr,\n"
+              "        frida_show_numa_map, &frida_numa_map_orig, NULL);\n"
+              "  if (frida_statm_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_statm_addr,\n"
+              "        frida_proc_pid_statm, &frida_statm_orig, NULL);\n"
+              "  if (frida_modules_show_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_modules_show_addr,\n"
+              "        frida_modules_show, &frida_modules_show_orig, NULL);\n"
+              "  if (frida_module_coresize_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_module_coresize_addr,\n"
+              "        frida_module_coresize_show, &frida_module_coresize_show_orig, NULL);\n"
+              "  if (frida_module_initsize_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_module_initsize_addr,\n"
+              "        frida_module_initsize_show, &frida_module_initsize_show_orig, NULL);\n"
+              "  if (frida_module_taint_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_module_taint_addr,\n"
+              "        frida_module_taint_show, &frida_module_taint_show_orig, NULL);\n"
+              "  if (frida_module_sect_read_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_module_sect_read_addr,\n"
+              "        frida_module_sect_read, &frida_module_sect_read_orig, NULL);\n"
+              "  if (frida_tcp4_show_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_tcp4_show_addr,\n"
+              "        frida_tcp4_show, &frida_tcp4_show_orig, NULL);\n"
+              "  if (frida_tcp6_show_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_tcp6_show_addr,\n"
+              "        frida_tcp6_show, &frida_tcp6_show_orig, NULL);\n"
+              "  if (frida_udp4_show_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_udp4_show_addr,\n"
+              "        frida_udp4_show, &frida_udp4_show_orig, NULL);\n"
+              "  if (frida_udp6_show_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_udp6_show_addr,\n"
+              "        frida_udp6_show, &frida_udp6_show_orig, NULL);\n"
+              "  if (frida_misc_show_addr != NULL)\n"
+              "    gum_interceptor_replace (frida_interceptor, frida_misc_show_addr,\n"
+              "        frida_misc_show, &frida_misc_show_orig, NULL);\n"
+          )
+          if "frida_show_smaps_rollup, &frida_smaps_rollup_orig" not in text:
+              assert text.count(hook_anchor) == 1, "hook anchor"
+              text = text.replace(hook_anchor, hook_extra + hook_anchor, 1)
+
+          revert_anchor = "    gum_interceptor_revert (frida_interceptor, frida_release_task_addr);\n"
+          revert_extra = (
+              "    if (frida_smaps_rollup_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_smaps_rollup_addr);\n"
+              "    if (frida_numa_map_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_numa_map_addr);\n"
+              "    if (frida_statm_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_statm_addr);\n"
+              "    if (frida_modules_show_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_modules_show_addr);\n"
+              "    if (frida_module_coresize_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_module_coresize_addr);\n"
+              "    if (frida_module_initsize_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_module_initsize_addr);\n"
+              "    if (frida_module_taint_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_module_taint_addr);\n"
+              "    if (frida_module_sect_read_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_module_sect_read_addr);\n"
+              "    if (frida_tcp4_show_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_tcp4_show_addr);\n"
+              "    if (frida_tcp6_show_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_tcp6_show_addr);\n"
+              "    if (frida_udp4_show_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_udp4_show_addr);\n"
+              "    if (frida_udp6_show_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_udp6_show_addr);\n"
+              "    if (frida_misc_show_addr != NULL)\n"
+              "      gum_interceptor_revert (frida_interceptor, frida_misc_show_addr);\n"
+          )
+          if "gum_interceptor_revert (frida_interceptor, frida_smaps_rollup_addr);" not in text:
+              assert text.count(revert_anchor) == 1, "revert anchor"
+              text = text.replace(revert_anchor, revert_anchor + revert_extra, 1)
+
+          ready_anchor = "  WRITE_ONCE (frida_hooks_ready, true);\n"
+          if "frida_forget_module_taint ();" not in text:
+              assert text.count(ready_anchor) == 1, "readiness anchor"
+              text = text.replace(ready_anchor,
+                  "  frida_forget_module_taint ();\n" + ready_anchor, 1)
+
+          if "frida_cloak_hidden_bytes (struct mm_struct * mm)\n{" not in text:
+              text = text.rstrip("\n") + "\n" + Path(os.environ["HIDE_IMPL"]).read_text() + "\n"
+
+          marker = 'MODULE_INFO (mm_hide, "extended-v3");'
+          if marker not in text:
+              text = text.rstrip("\n") + "\n\n" + marker + "\n"
+
+          p.write_text(text)
+
+          lib = Path(os.environ.get("FRIDA_LIB", ""))
+          if str(lib) != "" and lib.is_file():
+              rust = lib.read_text()
+              rust = rust.replace('"frida: ', '"kernel: ').replace('"rt: ', '"kernel: ')
+              lib.write_text(rust)
+
+          print("extended concealment applied")
+          PY_HIDE
+
+      - name: 编译内核模块
         run: |
           set -euo pipefail
           export PATH="$WORKDIR/clang18/bin:$HOME/.cargo/bin:$PATH"
@@ -1125,13 +1385,14 @@ jobs:
           VERMAGIC="$(modinfo -F vermagic "$KO")"
           test "${VERMAGIC%% *}" = "$EXPECTED_RELEASE"
           test "$(modinfo -F name "$KO")" = "$AGENT_MODULE_NAME"
-          test "$(modinfo -F fage_compat "$KO")" = 'android6.6-pid-v1'
-          test "$(modinfo -F fage_context_compat "$KO")" = 'ucounts-v1'
-          test "$(modinfo -F fage_callback_compat "$KO")" = 'module-notifier-cfi-v1'
-          test "$(modinfo -F fage_thread_abi "$KO")" = 'arm64-tagged-addr-v1'
-          test "$(modinfo -F fage_init_compat "$KO")" = 'module-init-constructors-v2'
-          test "$(modinfo -F fage_cloak_compat "$KO")" = 'hook-integrity-v1'
-          test "$(modinfo -F fage_visibility "$KO")" = 'visible-names-v1'
+          test "$(modinfo -F mm_compat "$KO")" = 'android6.6-pid-v1'
+          test "$(modinfo -F mm_context_compat "$KO")" = 'ucounts-v1'
+          test "$(modinfo -F mm_callback_compat "$KO")" = 'module-notifier-cfi-v1'
+          test "$(modinfo -F mm_thread_abi "$KO")" = 'arm64-tagged-addr-v1'
+          test "$(modinfo -F mm_init_compat "$KO")" = 'module-init-constructors-v2'
+          test "$(modinfo -F mm_cloak_compat "$KO")" = 'hook-integrity-v1'
+          test "$(modinfo -F mm_visibility "$KO")" = 'visible-names-v1'
+          test "$(modinfo -F mm_hide "$KO")" = 'extended-v3'
           mkdir -p "$OUTPUT"
           # Check the final Kbuild-linked ELF, including cached Cargo inputs.
           # The worker must have no remaining references to reclaimable init data.
@@ -1218,7 +1479,7 @@ jobs:
               print("Verified: original init layout retained; table references confined to frida_agent_start")
               print("Verified: asynchronous worker has no constructor-table references")
           PY_VERIFY_INIT
-          cp "$KO" "$OUTPUT/fage.ko"
+          cp "$KO" "$OUTPUT/$AGENT_MODULE_NAME.ko"
           cp "$WORKDIR/frida-core/src/barebone/agent/etc/linux-kmod.json" "$OUTPUT/"
           cp "$KOUT/.config" "$OUTPUT/kernel.config"
           cp "$KOUT/Module.symvers" "$KOUT/include/config/kernel.release" "$OUTPUT/"
@@ -1249,18 +1510,18 @@ jobs:
           # 目标设备的内核源码、配置和符号 CRC 必须与构建依赖匹配。
           # 先用 adb shell cat /proc/sys/kernel/osrelease 对照 kernel.release。
           # uname -r 可能被 SUSFS 改写，不能只比较 6.6.66 或修改后缀冒充 ABI 匹配。
-          # 先替换安装包中的 files/fage.ko，再打包安装并重启。
+          # 先替换安装包中的 files/adsp_mm.ko，再打包安装并重启。
           # 不要在旧模块仍加载时叠加加载新版模块。
-          adb push fage.ko /data/adb/app-desc/
-          adb shell su -c 'insmod /data/adb/app-desc/fage.ko'
-          adb shell su -c 'ls -l /dev/fage'
-          adb shell su -c 'cat /sys/module/fage/parameters/hooks_ready'
+          adb push adsp_mm.ko /data/adb/app-desc/
+          adb shell su -c 'insmod /data/adb/app-desc/adsp_mm.ko'
+          adb shell su -c 'ls -l /dev/adsp_mm'
+          adb shell su -c 'cat /sys/module/adsp_mm/parameters/enabled'
           adb shell su -c 'dmesg | tail -100'
-            # 用 modinfo -F fage_callback_compat fage.ko 确认输出
+            # 用 modinfo -F mm_callback_compat adsp_mm.ko 确认输出
             # module-notifier-cfi-v1；缺少该标记的旧产物仍可能在后续模块事件时 CFI panic。
-            # modinfo -F fage_thread_abi fage.ko 应输出 arm64-tagged-addr-v1；
+            # modinfo -F mm_thread_abi adsp_mm.ko 应输出 arm64-tagged-addr-v1；
             # 此补丁修复 ART futex 的 EFAULT，无需修改 JS 或禁用 JVMTI。
-          # modinfo -F fage_init_compat fage.ko 应输出 module-init-constructors-v2；
+          # modinfo -F mm_init_compat adsp_mm.ko 应输出 module-init-constructors-v2；
           # init-array-check.txt 应确认仅 frida_agent_start 引用构造函数表，worker 不再引用。
           # 保留旧版 .init_array 布局；在模块入口返回前使用完该表，修复启动竞态 panic。
             # 若旧模块已触发 dec_rlimit_ucounts 下溢及 pthread_create(EAGAIN)，
@@ -1268,22 +1529,22 @@ jobs:
             # 不加载任何兼容脚本，先验证 Java bridge 的原始初始化路径：
             frida -H 127.0.0.1:27043 -f com.xingin.xhs -e 'Java.perform(() => console.log("Java ready"))'
           INSTALL_EOF
-          (cd "$OUTPUT" && sha256sum fage.ko > fage.ko.sha256)
+          (cd "$OUTPUT" && sha256sum "$AGENT_MODULE_NAME.ko" > "$AGENT_MODULE_NAME.ko.sha256")
           {
             echo "### Frida Barebone $FRIDA_VERSION"
             echo "- Kernel: \`$EXPECTED_RELEASE\`"
             echo "- Kernel dependency cache: ${{ steps.kernel-cache.outputs.cache-hit == 'true' && 'hit' || 'miss (generated)' }}"
             echo "- Compile cache: ${{ steps.compile-cache.outputs.cache-hit == 'true' && 'hit' || 'miss or fallback' }}"
-            echo '- 唯一编译产物：fage.ko；附带配置、符号表和诊断信息。'
+            echo "- 唯一编译产物：$AGENT_MODULE_NAME.ko；附带配置、符号表和诊断信息。"
              echo '- 线程凭据补丁：ucounts-v1；迁移 RLIMIT_NPROC 计数，避免注入线程退出时扣错 UID。'
              echo '- 模块通知补丁：module-notifier-cfi-v1；修复 C 调用 Rust 模块事件回调时的 CFI panic。'
              echo '- 线程 ABI 补丁：arm64-tagged-addr-v1；继承带标签地址 ABI，修复 ART futex 的 EFAULT。'
             echo '- 初始化表补丁：module-init-constructors-v2；保留旧版节布局，构造函数移至启动 worker 之前。'
-            echo '- 可见名称：模块 fage，固定节点 /dev/fage，线程 rt-worker / rt-control。'
-            echo '- 隐藏钩子完整性：七个钩子全部成功才报告就绪；失败回滚，不开放设备服务。'
+            echo "- 内核侧名称：模块 $AGENT_MODULE_NAME，节点 /dev/$AGENT_DEVICE_NAME，线程并入 kworker 命名。"
+            echo '- 隐藏钩子完整性：基础七钩子全部成功才报告就绪；扩展钩子按符号可用性挂载，失败不影响启动。'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 上传 fage.ko
+      - name: 上传内核模块
         uses: actions/upload-artifact@v7
         with:
           name: Frida-Barebone-${{ env.FRIDA_VERSION }}-${{ env.KERNEL_VERSION }}
