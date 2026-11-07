@@ -35,6 +35,8 @@ env:
   KERNEL_NAME: android15-8-g29d86c5fc9dd-abogki428889875-4k
   KERNEL_CLANG_URL: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip
   FRIDA_VERSION: '17.25.2'
+  AGENT_MODULE_NAME: fage
+  AGENT_DEVICE_NAME: fage
   RUSTUP_TOOLCHAIN: stable
   CARGO_INCREMENTAL: '0'
   CCACHE_MAXSIZE: 2G
@@ -360,6 +362,10 @@ jobs:
           kbuild = root / "Kbuild"
 
           text = src.read_text()
+          # Normalize markers from an older patched source cache before applying
+          # the idempotent compatibility patches below.
+          for key in ("compat", "context_compat", "callback_compat", "thread_abi", "init_compat"):
+              text = text.replace(f'MODULE_INFO (frida_{key},', f'MODULE_INFO (fage_{key},')
 
           # Frida 17.25.2 assumes the newer detach_pid(freed, task, type) API.
           # Android 6.6 uses detach_pid(task, type), which frees unused PIDs itself.
@@ -404,7 +410,7 @@ jobs:
 
           if 'frida_free_pids_impl' in text or 'frida_detach_pid_impl (freed,' in text:
               raise SystemExit('incompatible PID API remains after patch')
-          compat_info = 'MODULE_INFO (frida_compat, "android6.6-pid-v1");'
+          compat_info = 'MODULE_INFO (fage_compat, "android6.6-pid-v1");'
           if compat_info not in text:
               text += '\n' + compat_info + '\n'
 
@@ -449,7 +455,7 @@ jobs:
           PY_PATCH
 
           echo "=== 验证 Frida 兼容补丁 ==="
-          grep -n -E 'FridaDetachPidFunc|frida_detach_pid_impl \(child|frida_compat' "$FRIDA_LINUX/frida-kmod.c"
+          grep -n -E 'FridaDetachPidFunc|frida_detach_pid_impl \(child|fage_compat' "$FRIDA_LINUX/frida-kmod.c"
           grep -n 'include "internal.h"' "$FRIDA_LINUX/frida-kmod.c"
           grep -n -A4 -B2 'undo_list = leader->sysvsem.undo_list' "$FRIDA_LINUX/frida-kmod.c"
           tail -n 8 "$FRIDA_LINUX/Kbuild"
@@ -505,7 +511,7 @@ jobs:
               if text.count(needle) != 1:
                   raise SystemExit(f'C/Rust callback boundary verification failed: {needle}')
 
-          marker = 'MODULE_INFO (frida_callback_compat, "module-notifier-cfi-v1");'
+          marker = 'MODULE_INFO (fage_callback_compat, "module-notifier-cfi-v1");'
           if marker not in text:
               text += '\n' + marker + '\n'
           if text.count(marker) != 1:
@@ -550,7 +556,7 @@ jobs:
           if text.count(new) != 1 or old in text:
               raise SystemExit('tagged-address ABI handoff verification failed')
 
-          marker = 'MODULE_INFO (frida_thread_abi, "arm64-tagged-addr-v1");'
+          marker = 'MODULE_INFO (fage_thread_abi, "arm64-tagged-addr-v1");'
           if marker not in text:
               text += '\n' + marker + '\n'
           if text.count(marker) != 1:
@@ -572,7 +578,7 @@ jobs:
 
           p = Path(os.environ["FRIDA_KMOD"])
           text = p.read_text()
-          marker = 'MODULE_INFO (frida_context_compat, "ucounts-v1");'
+          marker = 'MODULE_INFO (fage_context_compat, "ucounts-v1");'
 
           if marker not in text:
               replacements = [
@@ -869,8 +875,8 @@ jobs:
           if rust.count(inline_constructor_fn) != 1:
               raise SystemExit("ambiguous constructor iterator")
 
-          marker = 'MODULE_INFO (frida_init_compat, "module-init-constructors-v2");'
-          previous_marker = 'MODULE_INFO (frida_init_compat, "resident-init-array-v1");'
+          marker = 'MODULE_INFO (fage_init_compat, "module-init-constructors-v2");'
+          previous_marker = 'MODULE_INFO (fage_init_compat, "resident-init-array-v1");'
           code = source.read_text()
           if previous_marker in code:
               if code.count(previous_marker) != 1 or marker in code:
@@ -893,7 +899,186 @@ jobs:
           print(marker)
           PY_INIT_ARRAY
 
-      - name: 编译 frida-agent.ko
+      - name: 检查隐藏钩子完整性并调整可见标识
+        run: |
+          set -euo pipefail
+          python3 <<'PY_PROFILE'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path(os.environ["WORKDIR"]) / "frida-core/src/barebone/agent"
+          cfile = root / "linux/frida-kmod.c"
+          backend = root / "src/linux/kmod.rs"
+          entrypoint = root / "src/lib.rs"
+          config = root / "etc/linux-kmod.json"
+          code = cfile.read_text()
+          bridge = backend.read_text()
+          rust = entrypoint.read_text()
+          device = os.environ["AGENT_DEVICE_NAME"]
+          if not re.fullmatch(r"[a-z][a-z0-9_]{0,14}", device):
+              raise SystemExit("invalid fixed device name")
+          marker = 'MODULE_INFO (fage_cloak_compat, "hook-integrity-v1");'
+          hooks = (
+              ("show_map", "show_map"),
+              ("show_smap", "show_smap"),
+              ("proc_fill_cache", "proc_fill_cache"),
+              ("sys_prctl", None),
+              ("proc_pid_status", "proc_pid_status"),
+              ("do_task_stat", "do_task_stat"),
+              ("release_task", "release_task"),
+          )
+
+          if marker not in code:
+              declaration = 'void frida_kmod_install_hooks (void);'
+              old_start = 'void\nfrida_kmod_install_hooks (void)\n{'
+              old_end = '\nstatic void\nfrida_remove_cloak_hooks (void)\n'
+              if code.count(declaration) != 1 or code.count(old_start) != 1 or code.count(old_end) != 1:
+                  raise SystemExit("unexpected hook installation entrypoint")
+              start = code.index(old_start)
+              stop = code.index(old_end, start)
+              old_body = code[start:stop]
+              if old_body.count('gum_interceptor_replace (') != len(hooks):
+                  raise SystemExit("unexpected hook set; review upstream changes")
+              lines = [
+                  'int', 'frida_kmod_install_hooks (void)', '{',
+                  '  unsigned int i, installed = 0;', '  int result;',
+                  '  struct { const char * name; void ** target; void * replacement; void * original; } hooks[] =',
+                  '  {',
+              ]
+              for name, _ in hooks:
+                  lines.append(f'    {{ "{name}", &frida_{name}_addr, (void *) frida_{name}, &frida_{name}_orig }},')
+              lines += ['  };', '', '  WRITE_ONCE (frida_hooks_ready, false);', '']
+              for name, symbol in hooks:
+                  lookup = f'"{symbol}"' if symbol is not None else 'FRIDA_SYSCALL_NAME_PRCTL'
+                  lines.append(f'  frida_{name}_addr = (void *) frida_kmod_find_symbol ({lookup});')
+              for name in ('proc_task_instantiate', 'proc_fd_instantiate', 'proc_fdinfo_instantiate'):
+                  lines.append(f'  frida_{name}_addr = (void *) frida_kmod_find_symbol ("{name}");')
+              lines += [
+                  '',
+                  '  for (i = 0; i != ARRAY_SIZE (hooks); i++)',
+                  '  {',
+                  '    if (*hooks[i].target == NULL)',
+                  '    {',
+                  '      pr_err ("rt: required hook target unavailable: %s\\n", hooks[i].name);',
+                  '      return -ENOENT;',
+                  '    }',
+                  '  }',
+                  '  if (frida_proc_task_instantiate_addr == NULL || frida_proc_fd_instantiate_addr == NULL ||',
+                  '      frida_proc_fdinfo_instantiate_addr == NULL)',
+                  '  {',
+                  '    pr_err ("rt: proc directory classification helpers unavailable\\n");',
+                  '    return -ENOENT;',
+                  '  }',
+                  '',
+                  '  frida_op_worker = kthread_run (frida_op_worker_fn, NULL, "rt-control");',
+                  '  if (IS_ERR (frida_op_worker))',
+                  '  {',
+                  '    result = PTR_ERR (frida_op_worker);',
+                  '    frida_op_worker = NULL;',
+                  '    return result;',
+                  '  }',
+                  '  frida_interceptor = gum_interceptor_obtain ();',
+                  '  gum_interceptor_begin_transaction (frida_interceptor);',
+                  '  for (i = 0; i != ARRAY_SIZE (hooks); i++)',
+                  '  {',
+                  '    result = gum_interceptor_replace (frida_interceptor, *hooks[i].target,',
+                  '        hooks[i].replacement, hooks[i].original, NULL);',
+                  '    if (result != 0)',
+                  '    {',
+                  '      pr_err ("rt: hook installation failed: %s (%d)\\n", hooks[i].name, result);',
+                  '      goto rollback;',
+                  '    }',
+                  '    installed++;',
+                  '  }',
+                  '  gum_interceptor_end_transaction (frida_interceptor);',
+                  '  WRITE_ONCE (frida_hooks_ready, true);',
+                  '  return 0;',
+                  '',
+                  'rollback:',
+                  '  while (installed != 0)',
+                  '    gum_interceptor_revert (frida_interceptor, *hooks[--installed].target);',
+                  '  gum_interceptor_end_transaction (frida_interceptor);',
+                  '  kthread_stop (frida_op_worker);',
+                  '  frida_op_worker = NULL;',
+                  '  return -EIO;',
+                  '}', '',
+              ]
+              code = code[:start] + '\n'.join(lines) + code[stop:]
+              code = code.replace(declaration, 'int frida_kmod_install_hooks (void);', 1)
+              anchor = 'static struct task_struct * frida_op_worker;'
+              if code.count(anchor) != 1:
+                  raise SystemExit("cannot locate operation worker state")
+              code = code.replace(anchor, anchor + '\nstatic bool frida_hooks_ready;\n'
+                                  'module_param_named (hooks_ready, frida_hooks_ready, bool, 0444);', 1)
+              cleanup = 'frida_remove_cloak_hooks (void)\n{\n  struct frida_cloak * c, * next;'
+              if code.count(cleanup) != 1:
+                  raise SystemExit("cannot locate hook cleanup")
+              code = code.replace(cleanup, cleanup + '\n\n  WRITE_ONCE (frida_hooks_ready, false);', 1)
+              ping = '  if (op == FRIDA_CONTROL_OP_PING)\n    return FRIDA_CONTROL_MAGIC;'
+              if code.count(ping) != 1:
+                  raise SystemExit("cannot locate control readiness probe")
+              code = code.replace(ping, '  if (op == FRIDA_CONTROL_OP_PING)\n'
+                                  '    return READ_ONCE (frida_hooks_ready) ? FRIDA_CONTROL_MAGIC : -EAGAIN;', 1)
+
+              old_bridge = 'pub fn install_hooks() {\n    unsafe { frida_kmod_install_hooks() };\n}'
+              new_bridge = 'pub fn install_hooks() -> bool {\n    unsafe { frida_kmod_install_hooks() == 0 }\n}'
+              if bridge.count(old_bridge) != 1 or bridge.count('    fn frida_kmod_install_hooks();') != 1:
+                  raise SystemExit("unexpected Rust hook installation ABI")
+              bridge = bridge.replace(old_bridge, new_bridge, 1).replace(
+                  '    fn frida_kmod_install_hooks();', '    fn frida_kmod_install_hooks() -> c_int;', 1)
+              begin = '#[cfg(feature = "linux")]\nmod entrypoint_linux {\n'
+              end = '\n#[cfg(feature = "linux")]\npub use entrypoint_linux::'
+              start = rust.index(begin)
+              stop = rust.index(end, start)
+              module = rust[start:stop]
+              old_call = '            kernel::install_hooks();'
+              if module.count(old_call) != 1:
+                  raise SystemExit("unexpected Linux worker hook initialization")
+              module = module.replace(old_call,
+                  '            if !kernel::install_hooks() {\n'
+                  '                kernel::log("rt: required hooks unavailable\\n\\0");\n'
+                  '                WORKER_EXITED.store(true, Ordering::Release);\n'
+                  '                return;\n'
+                  '            }', 1)
+              rust = rust[:start] + module + rust[stop:]
+              code += '\n' + marker + '\n'
+
+          # Change visible labels only. Control magic, RPC strings and C/Rust
+          # symbol names are protocol/linker interfaces and remain unchanged.
+          dev_name = re.compile(r'(static struct miscdevice frida_dev\s*=\s*\{[^}]*?\.name\s*=\s*)"[^"]+"', re.S)
+          code, count = dev_name.subn(lambda m: m[1] + json.dumps(device), code)
+          if count != 1:
+              raise SystemExit("cannot uniquely locate the device registration name")
+          code = code.replace('"frida-agent"', '"rt-worker"').replace('"frida-op"', '"rt-control"')
+          code = code.replace('MODULE_DESCRIPTION ("Frida instrumentation agent");',
+                              'MODULE_DESCRIPTION ("ARM64 runtime support");')
+          code = code.replace('"frida: ', '"rt: ')
+          rust = rust.replace('"frida: ', '"rt: ')
+          visibility = 'MODULE_INFO (fage_visibility, "visible-names-v1");'
+          if visibility not in code:
+              code += '\n' + visibility + '\n'
+          for needle in (marker, visibility, 'int frida_kmod_install_hooks (void);',
+                         'module_param_named (hooks_ready, frida_hooks_ready, bool, 0444);'):
+              if code.count(needle) != 1:
+                  raise SystemExit(f"profile verification failed: {needle}")
+          if (bridge.count('fn frida_kmod_install_hooks() -> c_int;') != 1
+                  or rust.count('if !kernel::install_hooks() {') != 1):
+              raise SystemExit("C/Rust hook readiness handoff verification failed")
+          config_data = json.loads(config.read_text())
+          transport = config_data["agent"]["transport"]
+          if transport["type"] != "device" or transport["path"] not in ("/dev/frida", f"/dev/{device}"):
+              raise SystemExit("unexpected device transport configuration")
+          transport["path"] = f"/dev/{device}"
+          for path, content in ((cfile, code), (backend, bridge), (entrypoint, rust),
+                                (config, json.dumps(config_data, indent=2) + '\n')):
+              if path.read_text() != content:
+                  path.write_text(content)
+          print(f"Fixed device: /dev/{device}; required hooks: {len(hooks)}; rollback enabled")
+          PY_PROFILE
+
+      - name: 编译 fage.ko
         run: |
           set -euo pipefail
           export PATH="$WORKDIR/clang18/bin:$HOME/.cargo/bin:$PATH"
@@ -910,6 +1095,7 @@ jobs:
             AGENT_AR=aarch64-linux-gnu-ar \
             AGENT_NM=aarch64-linux-gnu-nm \
             AGENT_OBJCOPY=aarch64-linux-gnu-objcopy \
+            MODULE_NAME="$AGENT_MODULE_NAME" \
             KDIR="$WORKDIR/common" KOUT="$WORKDIR/common/out" \
             LLVM=1 CC='ccache clang' HOSTCC=gcc HOSTCXX=g++
           ccache --show-stats
@@ -930,7 +1116,7 @@ jobs:
       - name: 检查并整理模块产物
         run: |
           set -euo pipefail
-          KO="$WORKDIR/frida-core/src/barebone/agent/linux/frida-agent.ko"
+          KO="$WORKDIR/frida-core/src/barebone/agent/linux/$AGENT_MODULE_NAME.ko"
           OUTPUT="$WORKDIR/frida-output"
           KOUT="$WORKDIR/common/out"
           test -s "$KO"
@@ -938,11 +1124,14 @@ jobs:
           EXPECTED_RELEASE="$(cat "$KOUT/include/config/kernel.release")"
           VERMAGIC="$(modinfo -F vermagic "$KO")"
           test "${VERMAGIC%% *}" = "$EXPECTED_RELEASE"
-          test "$(modinfo -F frida_compat "$KO")" = 'android6.6-pid-v1'
-          test "$(modinfo -F frida_context_compat "$KO")" = 'ucounts-v1'
-          test "$(modinfo -F frida_callback_compat "$KO")" = 'module-notifier-cfi-v1'
-          test "$(modinfo -F frida_thread_abi "$KO")" = 'arm64-tagged-addr-v1'
-          test "$(modinfo -F frida_init_compat "$KO")" = 'module-init-constructors-v2'
+          test "$(modinfo -F name "$KO")" = "$AGENT_MODULE_NAME"
+          test "$(modinfo -F fage_compat "$KO")" = 'android6.6-pid-v1'
+          test "$(modinfo -F fage_context_compat "$KO")" = 'ucounts-v1'
+          test "$(modinfo -F fage_callback_compat "$KO")" = 'module-notifier-cfi-v1'
+          test "$(modinfo -F fage_thread_abi "$KO")" = 'arm64-tagged-addr-v1'
+          test "$(modinfo -F fage_init_compat "$KO")" = 'module-init-constructors-v2'
+          test "$(modinfo -F fage_cloak_compat "$KO")" = 'hook-integrity-v1'
+          test "$(modinfo -F fage_visibility "$KO")" = 'visible-names-v1'
           mkdir -p "$OUTPUT"
           # Check the final Kbuild-linked ELF, including cached Cargo inputs.
           # The worker must have no remaining references to reclaimable init data.
@@ -1029,7 +1218,7 @@ jobs:
               print("Verified: original init layout retained; table references confined to frida_agent_start")
               print("Verified: asynchronous worker has no constructor-table references")
           PY_VERIFY_INIT
-          cp "$KO" "$OUTPUT/frida-agent.ko"
+          cp "$KO" "$OUTPUT/fage.ko"
           cp "$WORKDIR/frida-core/src/barebone/agent/etc/linux-kmod.json" "$OUTPUT/"
           cp "$KOUT/.config" "$OUTPUT/kernel.config"
           cp "$KOUT/Module.symvers" "$KOUT/include/config/kernel.release" "$OUTPUT/"
@@ -1044,6 +1233,10 @@ jobs:
              echo 'Frida callback boundary: module-notifier-cfi-v1 (C/Rust notifier boundary only; kernel CFI retained)'
              echo 'Frida thread ABI: arm64-tagged-addr-v1 (inherit target tagged-address ABI before userspace entry)'
             echo 'Frida init table: module-init-constructors-v2 (run constructors before spawning worker; original ELF layout retained)'
+            echo "Module name: $AGENT_MODULE_NAME"
+            echo "Fixed device: /dev/$AGENT_DEVICE_NAME"
+            echo 'Hook integrity: all seven required hooks checked; partial installation rolled back'
+            echo 'Visible labels reduced; protocol constants and linker symbols retained'
             echo "Kernel release: $EXPECTED_RELEASE"
             echo "Kernel source: $KERNEL_REPO@$KERNEL_SHA"
             echo "Config SHA256: $(sha256sum "$KOUT/.config" | cut -d ' ' -f1)"
@@ -1056,15 +1249,18 @@ jobs:
           # 目标设备的内核源码、配置和符号 CRC 必须与构建依赖匹配。
           # 先用 adb shell cat /proc/sys/kernel/osrelease 对照 kernel.release。
           # uname -r 可能被 SUSFS 改写，不能只比较 6.6.66 或修改后缀冒充 ABI 匹配。
-          adb push frida-agent.ko /data/local/tmp/
-          adb shell su -c 'insmod /data/local/tmp/frida-agent.ko'
-          adb shell su -c 'ls -l /dev/frida'
+          # 先替换安装包中的 files/fage.ko，再打包安装并重启。
+          # 不要在旧模块仍加载时叠加加载新版模块。
+          adb push fage.ko /data/adb/app-desc/
+          adb shell su -c 'insmod /data/adb/app-desc/fage.ko'
+          adb shell su -c 'ls -l /dev/fage'
+          adb shell su -c 'cat /sys/module/fage/parameters/hooks_ready'
           adb shell su -c 'dmesg | tail -100'
-            # 用 modinfo -F frida_callback_compat frida-agent.ko 确认输出
+            # 用 modinfo -F fage_callback_compat fage.ko 确认输出
             # module-notifier-cfi-v1；缺少该标记的旧产物仍可能在后续模块事件时 CFI panic。
-            # modinfo -F frida_thread_abi frida-agent.ko 应输出 arm64-tagged-addr-v1；
+            # modinfo -F fage_thread_abi fage.ko 应输出 arm64-tagged-addr-v1；
             # 此补丁修复 ART futex 的 EFAULT，无需修改 JS 或禁用 JVMTI。
-          # modinfo -F frida_init_compat frida-agent.ko 应输出 module-init-constructors-v2；
+          # modinfo -F fage_init_compat fage.ko 应输出 module-init-constructors-v2；
           # init-array-check.txt 应确认仅 frida_agent_start 引用构造函数表，worker 不再引用。
           # 保留旧版 .init_array 布局；在模块入口返回前使用完该表，修复启动竞态 panic。
             # 若旧模块已触发 dec_rlimit_ucounts 下溢及 pthread_create(EAGAIN)，
@@ -1072,20 +1268,22 @@ jobs:
             # 不加载任何兼容脚本，先验证 Java bridge 的原始初始化路径：
             frida -H 127.0.0.1:27043 -f com.xingin.xhs -e 'Java.perform(() => console.log("Java ready"))'
           INSTALL_EOF
-          (cd "$OUTPUT" && sha256sum frida-agent.ko > frida-agent.ko.sha256)
+          (cd "$OUTPUT" && sha256sum fage.ko > fage.ko.sha256)
           {
             echo "### Frida Barebone $FRIDA_VERSION"
             echo "- Kernel: \`$EXPECTED_RELEASE\`"
             echo "- Kernel dependency cache: ${{ steps.kernel-cache.outputs.cache-hit == 'true' && 'hit' || 'miss (generated)' }}"
             echo "- Compile cache: ${{ steps.compile-cache.outputs.cache-hit == 'true' && 'hit' || 'miss or fallback' }}"
-            echo '- 唯一编译产物：frida-agent.ko；附带配置、符号表和诊断信息。'
+            echo '- 唯一编译产物：fage.ko；附带配置、符号表和诊断信息。'
              echo '- 线程凭据补丁：ucounts-v1；迁移 RLIMIT_NPROC 计数，避免注入线程退出时扣错 UID。'
              echo '- 模块通知补丁：module-notifier-cfi-v1；修复 C 调用 Rust 模块事件回调时的 CFI panic。'
              echo '- 线程 ABI 补丁：arm64-tagged-addr-v1；继承带标签地址 ABI，修复 ART futex 的 EFAULT。'
             echo '- 初始化表补丁：module-init-constructors-v2；保留旧版节布局，构造函数移至启动 worker 之前。'
+            echo '- 可见名称：模块 fage，固定节点 /dev/fage，线程 rt-worker / rt-control。'
+            echo '- 隐藏钩子完整性：七个钩子全部成功才报告就绪；失败回滚，不开放设备服务。'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 上传 frida-agent.ko
+      - name: 上传 fage.ko
         uses: actions/upload-artifact@v7
         with:
           name: Frida-Barebone-${{ env.FRIDA_VERSION }}-${{ env.KERNEL_VERSION }}
