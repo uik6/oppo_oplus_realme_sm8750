@@ -803,7 +803,7 @@ jobs:
           grep -n -A8 -B3 'misc_register(/dev/%s) failed' "$FRIDA_KMOD"
           grep -n -A14 'frida_kmod_link_close' "$FRIDA_KMOD" | tail -n 18
 
-      - name: 修复 KO 异步初始化表的内存生命周期
+      - name: 在模块入口执行构造函数并保留旧版节布局
         run: |
           set -euo pipefail
           python3 <<'PY_INIT_ARRAY'
@@ -814,29 +814,68 @@ jobs:
           root = Path(os.environ["WORKDIR"]) / "frida-core/src/barebone/agent/linux"
           linker = root / "prelink.lds"
           source = root / "frida-kmod.c"
+          rust_source = root.parent / "src/lib.rs"
           text = linker.read_text()
           old_header = re.compile(r"(?m)^([ \t]*)\.init_array(?=[ \t]+0[ \t]*:)")
-          new_header = re.compile(r"(?m)^[ \t]*\.frida_init_array(?=[ \t]+0[ \t]*:)")
+          resident_header = re.compile(r"(?m)^([ \t]*)\.frida_init_array(?=[ \t]+0[ \t]*:)")
 
-          # Linux frees all .init* sections after module_init() returns. The
-          # asynchronous Rust worker still needs these constructor pointers.
-          # Rename only the OUTPUT section; retain *(.init_array*) as the input
-          # selector and preserve _agent_init_start/_agent_init_end relocations.
-          if old_header.search(text):
-              if len(old_header.findall(text)) != 1 or new_header.search(text):
+          # Keep the original ELF layout and CONFIG_CONSTRUCTORS loader behavior.
+          # Undo the previous resident-section patch if present in a source cache.
+          if resident_header.search(text):
+              if len(resident_header.findall(text)) != 1 or old_header.search(text):
                   raise SystemExit("ambiguous constructor output section in prelink.lds")
-              text = old_header.sub(r"\1.frida_init_array", text, count=1)
-          if len(new_header.findall(text)) != 1:
-              raise SystemExit("cannot locate resident constructor output section")
+              text = resident_header.sub(r"\1.init_array", text, count=1)
+          if len(old_header.findall(text)) != 1:
+              raise SystemExit("cannot locate original constructor output section")
           table = re.search(
-              r"(?ms)^[ \t]*\.frida_init_array[ \t]+0[ \t]*:\s*\{([^{}]*)\}", text
+              r"(?ms)^[ \t]*\.init_array[ \t]+0[ \t]*:\s*\{([^{}]*)\}", text
           )
           required = ("_agent_init_start = .;", "*(.init_array*)", "_agent_init_end = .;")
           if table is None or any(table.group(1).count(item) != 1 for item in required):
               raise SystemExit("constructor bounds or input selector changed unexpectedly")
 
-          marker = 'MODULE_INFO (frida_init_compat, "resident-init-array-v1");'
+          rust = rust_source.read_text()
+          begin = '#[cfg(feature = "linux")]\nmod entrypoint_linux {\n'
+          end = '\n#[cfg(feature = "linux")]\npub use entrypoint_linux::'
+          if rust.count(begin) != 1 or rust.count(end) != 1:
+              raise SystemExit("cannot uniquely locate Linux agent entrypoint")
+          start = rust.index(begin)
+          stop = rust.index(end, start)
+          module = rust[start:stop]
+          spawn = '        if kernel::spawn_thread(worker, ptr::null_mut()) != 0 {\n'
+          worker_init = '            crate::run_constructors();\n            init_gum();\n'
+          sync_init = (
+              '        // Consume .init_array while module_init still owns its pages.\n'
+              '        // Gum initialization, hook installation and transport stay on the worker.\n'
+              '        unsafe { crate::run_constructors(); }\n\n'
+          )
+          if sync_init not in module:
+              if module.count(spawn) != 1 or module.count(worker_init) != 1:
+                  raise SystemExit("unexpected Linux worker constructor initialization")
+              module = module.replace(worker_init, '            init_gum();\n', 1)
+              module = module.replace(spawn, sync_init + spawn, 1)
+          if (module.count(sync_init) != 1 or module.count('crate::run_constructors();') != 1
+                  or module.count(spawn) != 1 or module.index(sync_init) > module.index(spawn)):
+              raise SystemExit("constructors must execute once before spawning the Linux worker")
+          rust = rust[:start] + module + rust[stop:]
+          constructor_fn = '#[cfg(not(feature = "xnu-kext"))]\npub(crate) unsafe fn run_constructors() {'
+          inline_constructor_fn = constructor_fn.replace(
+              '\npub(crate)', '\n#[cfg_attr(feature = "linux", inline(always))]\npub(crate)', 1
+          )
+          if inline_constructor_fn not in rust:
+              if rust.count(constructor_fn) != 1:
+                  raise SystemExit("cannot uniquely locate constructor iterator")
+              rust = rust.replace(constructor_fn, inline_constructor_fn, 1)
+          if rust.count(inline_constructor_fn) != 1:
+              raise SystemExit("ambiguous constructor iterator")
+
+          marker = 'MODULE_INFO (frida_init_compat, "module-init-constructors-v2");'
+          previous_marker = 'MODULE_INFO (frida_init_compat, "resident-init-array-v1");'
           code = source.read_text()
+          if previous_marker in code:
+              if code.count(previous_marker) != 1 or marker in code:
+                  raise SystemExit("ambiguous constructor compatibility migration")
+              code = code.replace(previous_marker, marker, 1)
           if marker not in code:
               code += "\n" + marker + "\n"
           if code.count(marker) != 1:
@@ -845,8 +884,10 @@ jobs:
               linker.write_text(text)
           if source.read_text() != code:
               source.write_text(code)
+          if rust_source.read_text() != rust:
+              rust_source.write_text(rust)
           # Relink the small prelinked object even if a source cache carried an
-          # older blob. Keep Cargo, ccache and prepared kernel dependencies.
+          # older blob. Cargo detects lib.rs changes; retain all dependency caches.
           (root / "frida-agent-prelinked.o.bin").unlink(missing_ok=True)
           print(text, end="")
           print(marker)
@@ -901,10 +942,10 @@ jobs:
           test "$(modinfo -F frida_context_compat "$KO")" = 'ucounts-v1'
           test "$(modinfo -F frida_callback_compat "$KO")" = 'module-notifier-cfi-v1'
           test "$(modinfo -F frida_thread_abi "$KO")" = 'arm64-tagged-addr-v1'
-          test "$(modinfo -F frida_init_compat "$KO")" = 'resident-init-array-v1'
+          test "$(modinfo -F frida_init_compat "$KO")" = 'module-init-constructors-v2'
           mkdir -p "$OUTPUT"
           # Check the final Kbuild-linked ELF, including cached Cargo inputs.
-          # A source marker alone cannot prove the constructor table is resident.
+          # The worker must have no remaining references to reclaimable init data.
           python3 - "$KO" <<'PY_VERIFY_INIT' | tee "$OUTPUT/init-array-check.txt"
           import sys
           from elftools.elf.elffile import ELFFile
@@ -918,13 +959,13 @@ jobs:
               elf = ELFFile(stream)
               require(elf.elfclass == 64 and elf["e_machine"] == "EM_AARCH64"
                       and elf["e_type"] == "ET_REL", "expected an ARM64 relocatable module")
-              table_index = elf.get_section_index(".frida_init_array")
-              require(table_index is not None, "missing resident .frida_init_array section")
+              table_index = elf.get_section_index(".init_array")
+              require(table_index is not None, "missing original .init_array section")
               table = elf.get_section(table_index)
               require(table["sh_flags"] & 2, "constructor table is not allocated")
               for section in elf.iter_sections():
-                  require(not (section["sh_flags"] & 2 and section.name.startswith(".init_array")),
-                          "constructor table remains in reclaimable .init_array memory")
+                  require(not (section["sh_flags"] & 2 and section.name.startswith(".frida_init_array")),
+                          "obsolete resident constructor section remains")
               symbols = elf.get_section_by_name(".symtab")
               require(symbols is not None, "module symbol table is missing")
               bounds = []
@@ -932,11 +973,36 @@ jobs:
                   matches = symbols.get_symbol_by_name(name) or []
                   require(len(matches) == 1, f"missing or ambiguous constructor bound: {name}")
                   symbol = matches[0]
-                  require(symbol["st_shndx"] == table_index, f"{name} is outside the resident table")
+                  require(symbol["st_shndx"] == table_index, f"{name} is outside the original table")
                   bounds.append(symbol["st_value"])
               start, end = bounds
               require(0 <= start < end <= table["sh_size"] and start % 8 == end % 8 == 0,
                       "invalid ARM64 constructor table bounds")
+              entrypoints = symbols.get_symbol_by_name("frida_agent_start") or []
+              require(len(entrypoints) == 1, "missing or ambiguous module-init agent entrypoint")
+              entrypoint = entrypoints[0]
+              require(isinstance(entrypoint["st_shndx"], int) and entrypoint["st_size"] > 0,
+                      "invalid module-init agent entrypoint")
+              entry_start = entrypoint["st_value"]
+              entry_end = entry_start + entrypoint["st_size"]
+              referenced_bounds = set()
+              for section in elf.iter_sections():
+                  if not isinstance(section, RelocationSection):
+                      continue
+                  caller = elf.get_section(section["sh_info"])
+                  if not caller["sh_flags"] & 2:
+                      continue
+                  relocation_symbols = elf.get_section(section["sh_link"])
+                  for relocation in section.iter_relocations():
+                      target = relocation_symbols.get_symbol(relocation["r_info_sym"])
+                      if target["st_shndx"] != table_index:
+                          continue
+                      require(section["sh_info"] == entrypoint["st_shndx"]
+                              and entry_start <= relocation["r_offset"] < entry_end,
+                              f"constructor table referenced outside module-init entrypoint: {caller.name}")
+                      referenced_bounds.add(target["st_value"] + relocation["r_addend"])
+              require({start, end}.issubset(referenced_bounds),
+                      "module-init entrypoint does not reference both constructor bounds")
               slots = set()
               for section in elf.iter_sections():
                   if not isinstance(section, RelocationSection) or section["sh_info"] != table_index:
@@ -957,10 +1023,11 @@ jobs:
                               "constructor target is outside resident executable memory")
                       slots.add(offset)
               require(slots == set(range(start, end, 8)), "constructor relocation coverage is incomplete")
-              print("Frida init compatibility: resident-init-array-v1")
+              print("Frida init compatibility: module-init-constructors-v2")
               print(f"Section: {table.name}; size={table['sh_size']}; flags={table['sh_flags']:#x}")
               print(f"Constructor bounds: {start:#x}..{end:#x}; entries={len(slots)}")
-              print("Verified: constructor table and all constructor targets are resident")
+              print("Verified: original init layout retained; table references confined to frida_agent_start")
+              print("Verified: asynchronous worker has no constructor-table references")
           PY_VERIFY_INIT
           cp "$KO" "$OUTPUT/frida-agent.ko"
           cp "$WORKDIR/frida-core/src/barebone/agent/etc/linux-kmod.json" "$OUTPUT/"
@@ -976,7 +1043,7 @@ jobs:
              echo 'Frida thread context: ucounts-v1 (balanced RLIMIT_NPROC credential transfer)'
              echo 'Frida callback boundary: module-notifier-cfi-v1 (C/Rust notifier boundary only; kernel CFI retained)'
              echo 'Frida thread ABI: arm64-tagged-addr-v1 (inherit target tagged-address ABI before userspace entry)'
-            echo 'Frida init table: resident-init-array-v1 (keep async worker constructors in resident module memory)'
+            echo 'Frida init table: module-init-constructors-v2 (run constructors before spawning worker; original ELF layout retained)'
             echo "Kernel release: $EXPECTED_RELEASE"
             echo "Kernel source: $KERNEL_REPO@$KERNEL_SHA"
             echo "Config SHA256: $(sha256sum "$KOUT/.config" | cut -d ' ' -f1)"
@@ -997,8 +1064,9 @@ jobs:
             # module-notifier-cfi-v1；缺少该标记的旧产物仍可能在后续模块事件时 CFI panic。
             # modinfo -F frida_thread_abi frida-agent.ko 应输出 arm64-tagged-addr-v1；
             # 此补丁修复 ART futex 的 EFAULT，无需修改 JS 或禁用 JVMTI。
-          # modinfo -F frida_init_compat frida-agent.ko 应输出 resident-init-array-v1；
-          # init-array-check.txt 应确认构造函数表常驻，修复 worker+0x30 启动竞态 panic。
+          # modinfo -F frida_init_compat frida-agent.ko 应输出 module-init-constructors-v2；
+          # init-array-check.txt 应确认仅 frida_agent_start 引用构造函数表，worker 不再引用。
+          # 保留旧版 .init_array 布局；在模块入口返回前使用完该表，修复启动竞态 panic。
             # 若旧模块已触发 dec_rlimit_ucounts 下溢及 pthread_create(EAGAIN)，
             # 替换 .ko 不会重置 UID 的运行时计数；需重启后加载新模块再验收。
             # 不加载任何兼容脚本，先验证 Java bridge 的原始初始化路径：
@@ -1014,7 +1082,7 @@ jobs:
              echo '- 线程凭据补丁：ucounts-v1；迁移 RLIMIT_NPROC 计数，避免注入线程退出时扣错 UID。'
              echo '- 模块通知补丁：module-notifier-cfi-v1；修复 C 调用 Rust 模块事件回调时的 CFI panic。'
              echo '- 线程 ABI 补丁：arm64-tagged-addr-v1；继承带标签地址 ABI，修复 ART futex 的 EFAULT。'
-            echo '- 初始化表补丁：resident-init-array-v1；修复 worker 读取已回收 .init_array 导致的 panic。'
+            echo '- 初始化表补丁：module-init-constructors-v2；保留旧版节布局，构造函数移至启动 worker 之前。'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传 frida-agent.ko
